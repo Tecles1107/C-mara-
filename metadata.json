@@ -1,0 +1,6 @@
+{
+  "name": "VigíaLAN — Monitor de Cámaras Termux",
+  "description": "Monitor web de cámaras de seguridad en red local para Termux con vista en tiempo real, audio, zoom digital, grabación de clips, modo mosaico y alertas de movimiento.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
