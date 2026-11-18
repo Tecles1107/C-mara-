@@ -93,6 +93,7 @@ interface SingleCameraViewProps {
   onRunDiagnostic: () => void;
   onRefreshDiagnostics: () => void;
   onClearDiagnostics: () => void;
+  onRetryVerify?: () => void;
 }
 
 export const SingleCameraView: React.FC<SingleCameraViewProps> = ({
@@ -141,6 +142,7 @@ export const SingleCameraView: React.FC<SingleCameraViewProps> = ({
   onRunDiagnostic,
   onRefreshDiagnostics,
   onClearDiagnostics,
+  onRetryVerify,
 }) => {
   const videoContainerRef = useRef<HTMLDivElement | null>(null);
 
@@ -154,6 +156,9 @@ export const SingleCameraView: React.FC<SingleCameraViewProps> = ({
 
   const needsAuth = camera.authStatus === 'required' || camera.authStatus === 'failed';
   const diagErrorCount = diagnosticSamples.filter((s) => s.status === 'error').length;
+  const lastVideoDiagnostic =
+    diagnosticSamples.find((s) => s.status !== 'ok' && (s.feature === 'video' || s.feature === 'verify')) ||
+    null;
 
   return (
     <div className="p-4 lg:p-6 space-y-5 max-w-6xl w-full mx-auto">
@@ -301,6 +306,13 @@ export const SingleCameraView: React.FC<SingleCameraViewProps> = ({
             snapshotTrigger={snapshotTrigger}
             onMotionScore={onMotionScore}
             onRecordingComplete={onRecordingComplete}
+            lastErrorDiagnostic={lastVideoDiagnostic}
+            onOpenCredentials={onOpenCredentials}
+            onRetryVerify={onRetryVerify}
+            onOpenDiagnostics={() => {
+              onBottomTabChange('diagnostics');
+              onRunDiagnostic();
+            }}
           />
 
           {irStatusLabel && (

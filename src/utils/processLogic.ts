@@ -11,7 +11,7 @@ export type ProcessStatus = 'running' | 'completed' | 'cancelled' | 'timeout' | 
 
 export interface ProcessOperationRecord {
   id: string;
-  kind: 'scan' | 'nmap' | 'onvif' | 'ssdp' | 'mdns' | 'arp' | 'vendor-udp' | 'stream' | 'audio' | 'talk' | 'verify';
+  kind: 'scan' | 'nmap' | 'onvif' | 'ssdp' | 'mdns' | 'arp' | 'vendor-udp' | 'route-vpn' | 'wifi' | 'external' | 'stream' | 'audio' | 'talk' | 'verify';
   target: string;
   pid?: number;
   status: ProcessStatus;

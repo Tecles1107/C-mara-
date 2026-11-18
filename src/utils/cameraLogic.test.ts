@@ -6,6 +6,8 @@ import {
   resolveEffectiveEndpoint,
   mergeCameraLists,
   parseSubnetInputs,
+  parseExternalScanTargets,
+  classifyStreamFailure,
   filterCameras,
   clampZoomPan,
   calculateMotionScore,
@@ -170,4 +172,27 @@ test('buildTermuxScript includes subnet, port, and remote tunnel option', () => 
   assert.ok(script.includes('PORT=8080'));
   assert.ok(script.includes('cloudflared tunnel'));
 });
+
+test('parseExternalScanTargets parses external IPs, ranges, DDNS hosts, URLs, and subnets', () => {
+  const parsed = parseExternalScanTargets(
+    '192.168.4.1-3, 10.0.0.10-10.0.0.11, cam.duckdns.org:8554, rtsp://admin:pass@172.20.10.4:554/live, 10.8.0.0/24'
+  );
+  assert.deepEqual(parsed.subnets, ['10.8.0']);
+  assert.ok(parsed.hosts.some((h) => h.host === '192.168.4.1' && h.source === 'range'));
+  assert.ok(parsed.hosts.some((h) => h.host === '192.168.4.3' && h.source === 'range'));
+  assert.ok(parsed.hosts.some((h) => h.host === '10.0.0.10' && h.source === 'range'));
+  assert.ok(parsed.hosts.some((h) => h.host === '10.0.0.11' && h.source === 'range'));
+  assert.ok(parsed.hosts.some((h) => h.host === 'cam.duckdns.org' && h.port === 8554 && h.source === 'ddns'));
+  assert.ok(parsed.hosts.some((h) => h.host === '172.20.10.4' && h.port === 554 && h.source === 'external-ip'));
+});
+
+test('classifyStreamFailure detects 401, 404, ECONNREFUSED, ENETUNREACH, ETIMEDOUT, and missing ffmpeg', () => {
+  assert.equal(classifyStreamFailure('HTTP error 401 Unauthorized', { host: '192.168.1.50', port: 554 }).code, '401');
+  assert.equal(classifyStreamFailure('Server returned 404 Stream Not Found', { host: '192.168.1.50', port: 554 }).code, '404');
+  assert.equal(classifyStreamFailure('connect ECONNREFUSED 127.0.0.1:554').code, 'ECONNREFUSED');
+  assert.equal(classifyStreamFailure('No route to host').code, 'ENETUNREACH');
+  assert.equal(classifyStreamFailure('Connection timed out').code, 'ETIMEDOUT');
+  assert.equal(classifyStreamFailure('spawn ffmpeg ENOENT').code, 'FFMPEG_MISSING');
+});
+
 

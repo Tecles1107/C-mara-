@@ -3,7 +3,10 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import { AddressInfo } from 'node:net';
 import {
+  COMMON_OUT_OF_NETWORK_CAMERA_IPS,
   buildCandidateHttpPorts,
+  discoverRouteAndVpnTargets,
+  isCameraLikeSsid,
   sendHttpTwoWayAudio,
   setCameraIrMode,
   toggleCameraLight,
@@ -166,3 +169,19 @@ test('toggleCameraLight and setCameraIrMode reject HTTP 200 HTML fallback pages'
     await new Promise<void>((resolve) => htmlServer.close(() => resolve()));
   }
 });
+
+test('isCameraLikeSsid detects common IP camera AP names and discoverRouteAndVpnTargets resolves cleanly', async () => {
+  assert.equal(isCameraLikeSsid('V380_AP_9482'), true);
+  assert.equal(isCameraLikeSsid('ESP32-CAM-AP'), true);
+  assert.equal(isCameraLikeSsid('IPC_55312'), true);
+  assert.equal(isCameraLikeSsid('Casa_WiFi_5G'), false);
+
+  assert.ok(COMMON_OUT_OF_NETWORK_CAMERA_IPS.includes('192.168.4.1'));
+  assert.ok(COMMON_OUT_OF_NETWORK_CAMERA_IPS.includes('192.168.1.64'));
+
+  const routes = await discoverRouteAndVpnTargets();
+  assert.ok(Array.isArray(routes.subnets));
+  assert.ok(Array.isArray(routes.vpnHosts));
+  assert.ok(Array.isArray(routes.gateways));
+});
+

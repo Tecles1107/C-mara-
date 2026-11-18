@@ -185,6 +185,218 @@ export function parseSubnetInputs(rawInput: string, fallbackSubnets: string[]): 
   return normalized.size > 0 ? Array.from(normalized) : fallbackSubnets;
 }
 
+export interface ExternalScanTargetHost {
+  host: string;
+  port?: number;
+  source: 'external-ip' | 'ddns' | 'range';
+}
+
+export interface ExternalScanTargets {
+  hosts: ExternalScanTargetHost[];
+  subnets: string[];
+}
+
+function isValidIPv4(ip: string): boolean {
+  const octets = ip.split('.');
+  return octets.length === 4 && octets.every((o) => /^\d{1,3}$/.test(o) && Number(o) >= 0 && Number(o) <= 255);
+}
+
+export function parseExternalScanTargets(rawInput: string): ExternalScanTargets {
+  const trimmed = rawInput.trim();
+  if (!trimmed) return { hosts: [], subnets: [] };
+
+  const tokens = trimmed
+    .split(/[,\s;]+/)
+    .map((t) => t.trim())
+    .filter(Boolean);
+
+  const hostsMap = new Map<string, ExternalScanTargetHost>();
+  const subnetSet = new Set<string>();
+
+  const addHost = (host: string, port: number | undefined, source: ExternalScanTargetHost['source']) => {
+    const key = `${host}:${port ?? 'auto'}`;
+    if (!hostsMap.has(key)) {
+      hostsMap.set(key, { host, port, source });
+    }
+  };
+
+  for (const rawToken of tokens) {
+    let token = rawToken;
+    if (/^(?:rtsp|https?):\/\//i.test(token)) {
+      token = token.replace(/^(?:rtsp|https?):\/\//i, '').split('/')[0];
+      if (token.includes('@')) {
+        token = token.split('@').pop() || token;
+      }
+    }
+
+    // 1. Short IPv4 range: 192.168.4.1-25
+    const shortRangeMatch = token.match(/^(\d{1,3}\.\d{1,3}\.\d{1,3})\.(\d{1,3})-(\d{1,3})$/);
+    if (shortRangeMatch) {
+      const prefix = shortRangeMatch[1];
+      const start = Math.max(1, Math.min(254, Number(shortRangeMatch[2])));
+      const end = Math.max(1, Math.min(254, Number(shortRangeMatch[3])));
+      if (prefix.split('.').every((o) => Number(o) <= 255)) {
+        const lo = Math.min(start, end);
+        const hi = Math.max(start, end);
+        for (let h = lo; h <= hi; h++) {
+          addHost(`${prefix}.${h}`, undefined, 'range');
+        }
+        continue;
+      }
+    }
+
+    // 2. Full IPv4 range in same /24: 10.0.0.10-10.0.0.50
+    const fullRangeMatch = token.match(/^(\d{1,3}\.\d{1,3}\.\d{1,3})\.(\d{1,3})-(\d{1,3}\.\d{1,3}\.\d{1,3})\.(\d{1,3})$/);
+    if (fullRangeMatch && fullRangeMatch[1] === fullRangeMatch[3]) {
+      const prefix = fullRangeMatch[1];
+      const start = Math.max(1, Math.min(254, Number(fullRangeMatch[2])));
+      const end = Math.max(1, Math.min(254, Number(fullRangeMatch[4])));
+      if (prefix.split('.').every((o) => Number(o) <= 255)) {
+        const lo = Math.min(start, end);
+        const hi = Math.max(start, end);
+        for (let h = lo; h <= hi; h++) {
+          addHost(`${prefix}.${h}`, undefined, 'range');
+        }
+        continue;
+      }
+    }
+
+    // 3. Subnet or CIDR (e.g. 10.8.0 or 10.8.0.0/24)
+    if (token.includes('/')) {
+      const base = token.replace(/\/\d+$/, '');
+      const octets = base.split('.');
+      if (octets.length === 3 && octets.every((o) => /^\d+$/.test(o) && Number(o) <= 255)) {
+        subnetSet.add(base);
+        continue;
+      }
+      if (isValidIPv4(base)) {
+        subnetSet.add(`${octets[0]}.${octets[1]}.${octets[2]}`);
+        continue;
+      }
+    }
+
+    const threeOctets = token.replace(/\.$/, '').split('.');
+    if (threeOctets.length === 3 && threeOctets.every((o) => /^\d+$/.test(o) && Number(o) <= 255)) {
+      subnetSet.add(threeOctets.join('.'));
+      continue;
+    }
+
+    // 4. IPv4 or hostname with optional :port
+    const hostPortMatch = token.match(/^([^:]+)(?::(\d{1,5}))?$/);
+    if (hostPortMatch) {
+      const host = hostPortMatch[1].trim();
+      const port = hostPortMatch[2] ? Number(hostPortMatch[2]) : undefined;
+      const validPort = port && port >= 1 && port <= 65535 ? port : undefined;
+
+      if (isValidIPv4(host)) {
+        addHost(host, validPort, 'external-ip');
+        continue;
+      }
+      if (/^[a-z0-9.-]+\.[a-z]{2,}$/i.test(host) || /^localhost$/i.test(host)) {
+        addHost(host, validPort, 'ddns');
+      }
+    }
+  }
+
+  return {
+    hosts: Array.from(hostsMap.values()),
+    subnets: Array.from(subnetSet),
+  };
+}
+
+export interface StreamErrorDiagnosis {
+  code: string;
+  reason: string;
+  suggestion: string;
+}
+
+export function classifyStreamFailure(
+  rawError: string,
+  target?: { host?: string; port?: number; path?: string; isRemote?: boolean }
+): StreamErrorDiagnosis {
+  const lower = (rawError || '').toLowerCase();
+  const hostInfo = target?.host ? `${target.host}${target.port ? `:${target.port}` : ''}` : 'la cámara';
+
+  if (lower.includes('401') || lower.includes('unauthorized') || lower.includes('authentication failed')) {
+    return {
+      code: '401',
+      reason: `Credenciales rechazadas (HTTP/RTSP 401) al abrir el stream de ${hostInfo}.`,
+      suggestion: 'Pulsa "Editar IP / Clave" para ingresar el usuario y contraseña correctos de la cámara.',
+    };
+  }
+
+  if (lower.includes('404') || lower.includes('stream not found') || lower.includes('not found')) {
+    return {
+      code: '404',
+      reason: `La cámara (${hostInfo}) respondió, pero rechazó la ruta ${target?.path || 'RTSP'} (404 Not Found).`,
+      suggestion: 'Pulsa "Verificar ruta" o prueba rutas comunes (/live/ch00_0, /stream1, /Streaming/Channels/101, /onvif1).',
+    };
+  }
+
+  if (lower.includes('403') || lower.includes('forbidden')) {
+    return {
+      code: '403',
+      reason: `Acceso denegado (403 Forbidden) o límite de conexiones simultáneas alcanzado en ${hostInfo}.`,
+      suggestion: 'Cierra otras apps conectadas a la cámara o revisa permisos del usuario.',
+    };
+  }
+
+  if (lower.includes('econnrefused') || lower.includes('connection refused')) {
+    return {
+      code: 'ECONNREFUSED',
+      reason: `Conexión rechazada (ECONNREFUSED) en ${hostInfo}: el puerto de video está cerrado.`,
+      suggestion: 'Verifica el puerto (554, 8554, 80, 8080) o activa RTSP/ONVIF en la configuración de la cámara.',
+    };
+  }
+
+  if (
+    lower.includes('no route to host') ||
+    lower.includes('ehostunreach') ||
+    lower.includes('enetunreach') ||
+    lower.includes('network is unreachable')
+  ) {
+    return {
+      code: 'ENETUNREACH',
+      reason: `Sin ruta de red hacia ${hostInfo} (cámara en otra subred, VPN apagada o Wi-Fi distinto).`,
+      suggestion: target?.isRemote
+        ? 'Activa Tailscale / túnel remoto o verifica el Host Remoto.'
+        : 'Usa "Escanear fuera de la red" en Opciones de escaneo o configura un Host Remoto.',
+    };
+  }
+
+  if (lower.includes('timed out') || lower.includes('etimedout') || lower.includes('timeout')) {
+    return {
+      code: 'ETIMEDOUT',
+      reason: `Tiempo de espera agotado conectando con ${hostInfo} (sin respuesta de video).`,
+      suggestion: 'Revisa si la cámara está encendida, la señal Wi-Fi o el reenvío de puertos.',
+    };
+  }
+
+  if (lower.includes('enoent') || lower.includes('spawn ffmpeg')) {
+    return {
+      code: 'FFMPEG_MISSING',
+      reason: 'No se encontró el binario ffmpeg en el servidor para decodificar RTSP.',
+      suggestion: 'Instala ffmpeg en el sistema o Termux (pkg install ffmpeg).',
+    };
+  }
+
+  if (lower.includes('invalid data') || lower.includes('could not find codec') || lower.includes('unsupported')) {
+    return {
+      code: 'CODEC_ERROR',
+      reason: `Error decodificando el flujo de ${hostInfo} (códec o formato no estándar).`,
+      suggestion: 'Prueba cambiar a sub-stream H.264 (ej. /live/ch00_1 o /Streaming/Channels/102).',
+    };
+  }
+
+  return {
+    code: 'STREAM_ERROR',
+    reason: rawError.trim()
+      ? `No se pudo abrir el stream de ${hostInfo}: ${rawError.trim().slice(0, 140)}`
+      : `No se recibió señal de video válida desde ${hostInfo}.`,
+    suggestion: 'Pulsa "Verificar ruta" para autodetectar puerto/ONVIF/RTSP o abre "Diagnóstico".',
+  };
+}
+
 export const INITIAL_CAMERAS: CameraChannel[] = [];
 
 export const DEFAULT_MOTION_CONFIG: MotionAlertConfig = {

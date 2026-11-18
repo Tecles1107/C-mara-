@@ -32,7 +32,7 @@ import {
   ScanProfile,
 } from './utils/processLogic';
 import { VisionMode } from './components/CameraFeedCanvas';
-import { CameraSidebar, ScanProgressState } from './components/CameraSidebar';
+import { CameraSidebar, NearbyWifiInfo, ScanProgressState } from './components/CameraSidebar';
 import { BottomTabType, SingleCameraView } from './components/SingleCameraView';
 import { MosaicView } from './components/MosaicView';
 import { SavedDevicesView } from './components/SavedDevicesView';
@@ -93,6 +93,9 @@ export default function App() {
   const [customSubnet, setCustomSubnet] = useState('');
   const [customTimeoutMs, setCustomTimeoutMs] = useState('');
   const [customConcurrency, setCustomConcurrency] = useState('');
+  const [outOfNetworkScan, setOutOfNetworkScan] = useState(false);
+  const [externalTargets, setExternalTargets] = useState('');
+  const [wifiNetworks, setWifiNetworks] = useState<NearbyWifiInfo[]>([]);
   const [isScanning, setIsScanning] = useState(false);
   const [scanProgress, setScanProgress] = useState<ScanProgressState | null>(null);
   const [showAddForm, setShowAddForm] = useState(false);
@@ -522,16 +525,23 @@ export default function App() {
     fetchProcesses();
   }, [fetchProcesses]);
 
-  const handleScanNetwork = () => {
+  const handleScanNetwork = (forceOutOfNetwork = false) => {
     if (scanSourceRef.current) {
       scanSourceRef.current.close();
       scanSourceRef.current = null;
     }
+    const useOutOfNetwork = forceOutOfNetwork || outOfNetworkScan || Boolean(externalTargets.trim());
+    if (forceOutOfNetwork && !outOfNetworkScan) {
+      setOutOfNetworkScan(true);
+    }
     setIsScanning(true);
     setScanMessage('');
+    setWifiNetworks([]);
     setScanProgress({
       stage: 'discovery',
-      label: 'Iniciando escaneo de red...',
+      label: useOutOfNetwork
+        ? 'Iniciando escaneo local + fuera de red (VPN, rutas, Wi-Fi)...'
+        : 'Iniciando escaneo de red...',
       completed: 0,
       total: 1,
       elapsedMs: 0,
@@ -543,6 +553,8 @@ export default function App() {
     if (customSubnet.trim()) params.set('subnet', customSubnet.trim());
     if (customTimeoutMs.trim()) params.set('timeoutMs', customTimeoutMs.trim());
     if (customConcurrency.trim()) params.set('concurrency', customConcurrency.trim());
+    if (useOutOfNetwork) params.set('outOfNetwork', '1');
+    if (externalTargets.trim()) params.set('externalTargets', externalTargets.trim());
 
     const es = new EventSource(`/api/scan-stream?${params.toString()}`);
     scanSourceRef.current = es;
@@ -551,6 +563,15 @@ export default function App() {
       try {
         const data = JSON.parse((ev as MessageEvent).data) as ScanProgressState;
         setScanProgress(data);
+      } catch {
+        // Ignore parse issues
+      }
+    });
+
+    es.addEventListener('wifi', (ev) => {
+      try {
+        const nets = JSON.parse((ev as MessageEvent).data) as NearbyWifiInfo[];
+        if (Array.isArray(nets)) setWifiNetworks(nets);
       } catch {
         // Ignore parse issues
       }
@@ -575,16 +596,25 @@ export default function App() {
         const result = JSON.parse((ev as MessageEvent).data) as {
           subnets?: string[];
           cameras?: CameraChannel[];
+          wifiNetworks?: NearbyWifiInfo[];
+          externalRoutes?: string[];
           cancelled?: boolean;
           durationMs?: number;
         };
+        if (Array.isArray(result.wifiNetworks) && result.wifiNetworks.length > 0) {
+          setWifiNetworks(result.wifiNetworks);
+        }
         const count = result.cameras?.length ?? 0;
+        const routesNote =
+          result.externalRoutes && result.externalRoutes.length > 0
+            ? ` + rutas externas (${result.externalRoutes.join(', ')})`
+            : '';
         setScanMessage(
           result.cancelled
             ? 'Escaneo cancelado.'
             : count > 0
-              ? `Se encontraron ${count} cámaras en ${result.subnets?.join(', ') || 'red local'} (${result.durationMs ?? 0} ms).`
-              : `No se detectaron cámaras en ${result.subnets?.join(', ') || 'la red local'}.`
+              ? `Se encontraron ${count} cámaras en ${result.subnets?.join(', ') || 'red local'}${routesNote} (${result.durationMs ?? 0} ms).`
+              : `No se detectaron cámaras en ${result.subnets?.join(', ') || 'la red local'}${routesNote}.`
         );
       } catch {
         setScanMessage('Escaneo finalizado.');
@@ -953,7 +983,7 @@ export default function App() {
           ) : (
             <button
               type="button"
-              onClick={handleScanNetwork}
+              onClick={() => handleScanNetwork(false)}
               className="flex items-center gap-2 px-3.5 py-2 text-xs font-medium text-white bg-sky-600 hover:bg-sky-500 rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer"
             >
               <RefreshCw className="w-3.5 h-3.5" />
@@ -984,6 +1014,9 @@ export default function App() {
             customSubnet={customSubnet}
             customTimeoutMs={customTimeoutMs}
             customConcurrency={customConcurrency}
+            outOfNetworkScan={outOfNetworkScan}
+            externalTargets={externalTargets}
+            wifiNetworks={wifiNetworks}
             searchQuery={searchQuery}
             protocolFilter={protocolFilter}
             onlyOnline={onlyOnline}
@@ -995,6 +1028,9 @@ export default function App() {
             onCustomSubnetChange={setCustomSubnet}
             onCustomTimeoutChange={setCustomTimeoutMs}
             onCustomConcurrencyChange={setCustomConcurrency}
+            onOutOfNetworkScanChange={setOutOfNetworkScan}
+            onExternalTargetsChange={setExternalTargets}
+            onStartOutOfNetworkScan={() => handleScanNetwork(true)}
             onCancelScan={handleCancelScan}
             onSearchQueryChange={setSearchQuery}
             onProtocolFilterChange={setProtocolFilter}
@@ -1050,12 +1086,20 @@ export default function App() {
                 <div className="flex flex-wrap items-center justify-center gap-3">
                   <button
                     type="button"
-                    onClick={isScanning ? handleCancelScan : handleScanNetwork}
+                    onClick={isScanning ? handleCancelScan : () => handleScanNetwork(false)}
                     className={`px-4 py-2 text-xs font-medium text-white rounded-lg transition-colors cursor-pointer ${
                       isScanning ? 'bg-red-600 hover:bg-red-500' : 'bg-sky-600 hover:bg-sky-500'
                     }`}
                   >
                     {isScanning ? 'Cancelar Escaneo' : 'Escanear Red Local'}
+                  </button>
+                  <button
+                    type="button"
+                    disabled={isScanning}
+                    onClick={() => handleScanNetwork(true)}
+                    className="px-4 py-2 text-xs font-medium text-sky-200 bg-sky-950/60 border border-sky-800/70 hover:bg-sky-900/60 disabled:opacity-40 rounded-lg transition-colors cursor-pointer"
+                  >
+                    Escanear fuera de la red
                   </button>
                   <button
                     type="button"
@@ -1145,6 +1189,7 @@ export default function App() {
               onRunDiagnostic={handleRunDiagnostic}
               onRefreshDiagnostics={() => fetchDiagnostics(selectedCamera.ip)}
               onClearDiagnostics={handleClearDiagnostics}
+              onRetryVerify={() => verifyAndUpdateCamera(selectedCamera)}
             />
           )}
         </main>

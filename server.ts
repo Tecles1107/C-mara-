@@ -7,9 +7,12 @@ import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import path from 'node:path';
 import {
+  COMMON_OUT_OF_NETWORK_CAMERA_IPS,
   buildCandidateHttpPorts,
   discoverArpNeighbors,
   discoverMdnsCameras,
+  discoverNearbyWifiNetworks,
+  discoverRouteAndVpnTargets,
   discoverSsdpDevices,
   discoverVendorUdpCameras,
   fetchWithAuth,
@@ -20,12 +23,15 @@ import {
   sendHttpTwoWayAudio,
   setCameraIrMode,
   toggleCameraLight,
+  type NearbyWifiNetwork,
 } from './server/cameraBridge.ts';
 import { diagnosticsManager } from './server/diagnosticsManager.ts';
 import { processManager } from './server/processManager.ts';
 import { probeRtspBackchannel, rtspBackchannelPool } from './server/rtspBackchannel.ts';
 import { savedCamerasStore } from './server/savedCamerasStore.ts';
 import {
+  classifyStreamFailure,
+  parseExternalScanTargets,
   parseSubnetInputs,
   type CameraChannel,
   type ConnectionMode,
@@ -315,7 +321,7 @@ function getPortMeta(port: number): { protocol: CameraChannel['protocol']; defau
 }
 
 interface ScanProgressPayload {
-  stage: 'discovery' | 'nmap' | 'tcp-pool' | 'complete' | 'cancelled';
+  stage: 'discovery' | 'external' | 'nmap' | 'tcp-pool' | 'complete' | 'cancelled';
   label: string;
   completed: number;
   total: number;
@@ -325,27 +331,49 @@ interface ScanProgressPayload {
 
 async function executeNetworkScan(params: {
   rawSubnet: string;
+  externalTargets?: string;
+  outOfNetwork?: boolean;
   profile: ScanProfile;
   customTimeoutMs?: number;
   customConcurrency?: number;
   controller: AbortController;
   onProgress?: (payload: ScanProgressPayload) => void;
   onCamera?: (cam: CameraChannel) => void;
-}): Promise<{ subnets: string[]; cameras: CameraChannel[]; cancelled: boolean; durationMs: number }> {
-  const { rawSubnet, profile, customTimeoutMs, customConcurrency, controller, onProgress, onCamera } = params;
+  onWifiNetworks?: (networks: NearbyWifiNetwork[]) => void;
+}): Promise<{
+  subnets: string[];
+  cameras: CameraChannel[];
+  wifiNetworks: NearbyWifiNetwork[];
+  externalRoutes: string[];
+  cancelled: boolean;
+  durationMs: number;
+}> {
+  const {
+    rawSubnet,
+    externalTargets = '',
+    outOfNetwork = false,
+    profile,
+    customTimeoutMs,
+    customConcurrency,
+    controller,
+    onProgress,
+    onCamera,
+    onWifiNetworks,
+  } = params;
   const startedAt = Date.now();
   const config = getScanConfigForProfile(profile, customTimeoutMs, customConcurrency);
   const allDetected = Array.from(new Set(getAllLocalIPv4Addresses().map((a) => a.subnet)));
   const nonLinkLocal = allDetected.filter((s) => !s.startsWith('169.254.'));
   const detectedSubnets = nonLinkLocal.length > 0 ? nonLinkLocal : allDetected;
-  const subnets = parseSubnetInputs(rawSubnet, detectedSubnets);
+  const parsedExternal = parseExternalScanTargets(externalTargets);
+  const baseSubnets = parseSubnetInputs(rawSubnet, detectedSubnets);
 
   const scanOpId = processManager.startOperation(
     'scan',
-    subnets.length > 0 ? subnets.map((s) => `${s}.0/24`).join(', ') : 'Sin subred',
+    baseSubnets.length > 0 ? baseSubnets.map((s) => `${s}.0/24`).join(', ') : 'Red local + externa',
     {
       controller,
-      detail: `Perfil ${profile} · timeout ${config.connectTimeoutMs}ms · hilos ${config.concurrency}`,
+      detail: `Perfil ${profile}${outOfNetwork ? ' · Fuera de red' : ''} · timeout ${config.connectTimeoutMs}ms`,
     }
   );
 
@@ -380,7 +408,9 @@ async function executeNetworkScan(params: {
 
   onProgress?.({
     stage: 'discovery',
-    label: 'Descubrimiento ONVIF, SSDP, mDNS, UDP fabricantes y ARP',
+    label: outOfNetwork
+      ? 'Descubrimiento local + rutas VPN / Wi-Fi / dispositivos externos'
+      : 'Descubrimiento ONVIF, SSDP, mDNS, UDP fabricantes y ARP',
     completed: 0,
     total: 5,
     elapsedMs: Date.now() - startedAt,
@@ -400,7 +430,19 @@ async function executeNetworkScan(params: {
     detail: 'ip neigh / /proc/net/arp',
   });
 
-  const [onvifFound, ssdpFound, mdnsFound, vendorUdpFound, arpFound] = await Promise.all([
+  const shouldRunOutOfNetwork = outOfNetwork || parsedExternal.hosts.length > 0 || parsedExternal.subnets.length > 0;
+  const routeOpId = shouldRunOutOfNetwork
+    ? processManager.startOperation('route-vpn', 'Rutas IP / Tailscale VPN', {
+        detail: 'Buscando subredes y nodos fuera de LAN',
+      })
+    : null;
+  const wifiOpId = shouldRunOutOfNetwork
+    ? processManager.startOperation('wifi', 'Wi-Fi cercanos y ocultos', {
+        detail: 'termux-wifi-scaninfo / nmcli',
+      })
+    : null;
+
+  const [onvifFound, ssdpFound, mdnsFound, vendorUdpFound, arpFound, routeVpn, wifiNetworks] = await Promise.all([
     discoverOnvifDevices(1100, controller.signal),
     discoverSsdpDevices(1000).then((items) => {
       processManager.completeOperation(ssdpOpId, 'completed', `${items.length} respuestas SSDP`, 0);
@@ -418,7 +460,37 @@ async function executeNetworkScan(params: {
       processManager.completeOperation(arpOpId, 'completed', `${items.length} vecinos ARP`, 0);
       return items;
     }),
+    shouldRunOutOfNetwork
+      ? discoverRouteAndVpnTargets().then((res) => {
+          if (routeOpId) {
+            processManager.completeOperation(
+              routeOpId,
+              'completed',
+              `${res.subnets.length} subredes · ${res.vpnHosts.length} nodos VPN/GW`,
+              0
+            );
+          }
+          return res;
+        })
+      : Promise.resolve({ subnets: [], vpnHosts: [], gateways: [], routesSummary: [] }),
+    shouldRunOutOfNetwork
+      ? discoverNearbyWifiNetworks().then((nets) => {
+          if (wifiOpId) {
+            processManager.completeOperation(
+              wifiOpId,
+              'completed',
+              `${nets.length} redes Wi-Fi (${nets.filter((n) => n.cameraLikely).length} cámaras/ocultas)`,
+              0
+            );
+          }
+          return nets;
+        })
+      : Promise.resolve([]),
   ]);
+
+  if (wifiNetworks.length > 0) {
+    onWifiNetworks?.(wifiNetworks);
+  }
 
   for (const cam of onvifFound) pushCamera(cam);
   for (const s of ssdpFound) {
@@ -481,28 +553,98 @@ async function executeNetworkScan(params: {
     });
   }
 
+  // Merge local subnets + explicitly requested external subnets + discovered route subnets (up to 3 extra routes)
+  const extraRouteSubnets = outOfNetwork ? routeVpn.subnets.slice(0, 3) : [];
+  const subnets = Array.from(new Set([...baseSubnets, ...parsedExternal.subnets, ...extraRouteSubnets]));
+
   const allTargets: Array<{
-    subnet: string;
+    locationLabel: string;
     ip: string;
     port: number;
+    timeoutMs: number;
     protocol: CameraChannel['protocol'];
     defaultPath: string;
   }> = [];
   const scheduledTargetSet = new Set<string>();
-  const addTarget = (subnet: string, ip: string, port: number) => {
+  const addTarget = (locationLabel: string, ip: string, port: number, timeoutMs: number) => {
     const tk = `${ip}:${port}`;
     if (scheduledTargetSet.has(tk)) return;
     scheduledTargetSet.add(tk);
     const meta = getPortMeta(port);
-    allTargets.push({ subnet, ip, port, ...meta });
+    allTargets.push({ locationLabel, ip, port, timeoutMs, ...meta });
   };
 
   for (const neighbor of arpFound) {
     const parts = neighbor.ip.split('.');
     const nSubnet = `${parts[0]}.${parts[1]}.${parts[2]}`;
     for (const port of config.ports) {
-      addTarget(nSubnet, neighbor.ip, port);
+      addTarget(`Subred ${nSubnet}.0/24 (ARP)`, neighbor.ip, port, config.connectTimeoutMs);
     }
+  }
+
+  // Out-of-network targets: VPN peers, gateways, AP/factory camera IPs, saved remote devices, and user external IPs/DDNS
+  if (shouldRunOutOfNetwork) {
+    const externalTimeout = Math.max(config.connectTimeoutMs, 650);
+    const extOpId = processManager.startOperation(
+      'external',
+      `${parsedExternal.hosts.length + routeVpn.vpnHosts.length} destinos externos`,
+      { detail: 'VPN Tailscale, rutas, AP cámaras y DDNS' }
+    );
+
+    onProgress?.({
+      stage: 'external',
+      label: 'Preparando destinos fuera de la red (VPN / Rutas / DDNS / AP)',
+      completed: 1,
+      total: 2,
+      elapsedMs: Date.now() - startedAt,
+      foundCount: found.length,
+    });
+
+    for (const vh of routeVpn.vpnHosts) {
+      const label = vh.source === 'tailscale' ? `VPN Tailscale (${vh.name || vh.ip})` : `Ruta Externa (${vh.ip})`;
+      for (const port of config.ports) {
+        addTarget(label, vh.ip, port, externalTimeout);
+      }
+    }
+
+    if (outOfNetwork) {
+      for (const apIp of COMMON_OUT_OF_NETWORK_CAMERA_IPS) {
+        for (const port of config.ports) {
+          addTarget('AP / IP de fábrica externa', apIp, port, Math.max(config.connectTimeoutMs, 420));
+        }
+      }
+    }
+
+    for (const saved of savedCamerasStore.list()) {
+      if (saved.ip) {
+        for (const p of Array.from(new Set([saved.port, saved.onvifPort, ...config.ports].filter((n): n is number => Boolean(n))))) {
+          addTarget('Guardado (IP)', saved.ip, p, externalTimeout);
+        }
+      }
+      if (saved.remoteHost && saved.remoteHost.trim()) {
+        const rpList = Array.from(
+          new Set([saved.remotePort || saved.port, saved.remoteOnvifPort, 554, 8554, 80, 8000].filter((n): n is number => Boolean(n)))
+        );
+        for (const rp of rpList) {
+          addTarget(`Remoto (${saved.remoteHost.trim()})`, saved.remoteHost.trim(), rp, Math.max(externalTimeout, 900));
+        }
+      }
+    }
+
+    for (const ext of parsedExternal.hosts) {
+      const targetPorts = ext.port ? [ext.port, ...config.ports] : config.ports;
+      const label = ext.source === 'ddns' ? `DDNS / Host (${ext.host})` : `Externa (${ext.host})`;
+      for (const p of Array.from(new Set(targetPorts))) {
+        addTarget(label, ext.host, p, Math.max(externalTimeout, 850));
+      }
+    }
+
+    processManager.completeOperation(
+      extOpId,
+      'completed',
+      `${allTargets.length} sondas externas en cola`,
+      0
+    );
   }
 
   for (const subnet of subnets) {
@@ -523,7 +665,7 @@ async function executeNetworkScan(params: {
     for (let host = 1; host <= 254; host++) {
       const ip = `${subnet}.${host}`;
       for (const port of config.ports) {
-        addTarget(subnet, ip, port);
+        addTarget(`Subred ${subnet}.0/24`, ip, port, config.connectTimeoutMs);
       }
     }
   }
@@ -543,7 +685,7 @@ async function executeNetworkScan(params: {
       allTargets,
       config.concurrency,
       async (t) => {
-        const probe = await probePortWithLatency(t.ip, t.port, config.connectTimeoutMs);
+        const probe = await probePortWithLatency(t.ip, t.port, t.timeoutMs);
         if (!probe.open) return null;
         recordIpPort(t.ip, t.port);
 
@@ -552,9 +694,16 @@ async function executeNetworkScan(params: {
           return null;
         }
 
+        const isExternalLoc =
+          t.locationLabel.includes('VPN') ||
+          t.locationLabel.includes('Externa') ||
+          t.locationLabel.includes('DDNS') ||
+          t.locationLabel.includes('Remoto') ||
+          t.locationLabel.includes('fábrica');
+
         const cam: CameraChannel = {
-          id: `cam-${t.ip.replace(/\./g, '-')}-${t.port}`,
-          name: `Cámara ${t.ip}`,
+          id: `cam-${t.ip.replace(/[^a-zA-Z0-9]/g, '-')}-${t.port}`,
+          name: isExternalLoc ? `Cámara Externa ${t.ip}` : `Cámara ${t.ip}`,
           ip: t.ip,
           port: targetPort,
           onvifPort: t.protocol === 'ONVIF' ? t.port : undefined,
@@ -564,7 +713,7 @@ async function executeNetworkScan(params: {
           resolution: 'Auto',
           fps: 25,
           hasAudio: t.protocol === 'RTSP' || t.protocol === 'ONVIF',
-          location: `Subred ${t.subnet}.0/24`,
+          location: t.locationLabel,
           nightVision: false,
           authStatus: 'unknown',
           latencyMs: probe.latencyMs,
@@ -614,12 +763,21 @@ async function executeNetworkScan(params: {
     foundCount: found.length,
   });
 
-  return { subnets, cameras: found, cancelled, durationMs };
+  return {
+    subnets,
+    cameras: found,
+    wifiNetworks,
+    externalRoutes: routeVpn.subnets,
+    cancelled,
+    durationMs,
+  };
 }
 
 // Live SSE scanner with real-time stage progress, per-camera streaming, and cancellation
 app.get('/api/scan-stream', async (req, res) => {
   const rawSubnet = typeof req.query.subnet === 'string' ? req.query.subnet.trim() : '';
+  const externalTargets = typeof req.query.externalTargets === 'string' ? req.query.externalTargets.trim() : '';
+  const outOfNetwork = req.query.outOfNetwork === '1' || req.query.outOfNetwork === 'true';
   const profileParam = typeof req.query.profile === 'string' ? req.query.profile : 'standard';
   const profile: ScanProfile =
     profileParam === 'fast' || profileParam === 'deep' ? profileParam : 'standard';
@@ -646,12 +804,15 @@ app.get('/api/scan-stream', async (req, res) => {
   try {
     const result = await executeNetworkScan({
       rawSubnet,
+      externalTargets,
+      outOfNetwork,
       profile,
       customTimeoutMs,
       customConcurrency,
       controller,
       onProgress: (payload) => sendEvent('progress', payload),
       onCamera: (cam) => sendEvent('camera', cam),
+      onWifiNetworks: (nets) => sendEvent('wifi', nets),
     });
     sendEvent('done', result);
   } catch (err) {
@@ -666,6 +827,8 @@ app.get('/api/scan-stream', async (req, res) => {
 // JSON scan endpoint (shares concurrency, latency & processManager tracking)
 app.get('/api/scan', async (req, res) => {
   const rawSubnet = typeof req.query.subnet === 'string' ? req.query.subnet.trim() : '';
+  const externalTargets = typeof req.query.externalTargets === 'string' ? req.query.externalTargets.trim() : '';
+  const outOfNetwork = req.query.outOfNetwork === '1' || req.query.outOfNetwork === 'true';
   const profileParam = typeof req.query.profile === 'string' ? req.query.profile : 'standard';
   const profile: ScanProfile =
     profileParam === 'fast' || profileParam === 'deep' ? profileParam : 'standard';
@@ -677,6 +840,8 @@ app.get('/api/scan', async (req, res) => {
 
   const result = await executeNetworkScan({
     rawSubnet,
+    externalTargets,
+    outOfNetwork,
     profile,
     customTimeoutMs,
     customConcurrency,
@@ -1001,12 +1166,20 @@ app.get('/api/stream', async (req, res) => {
   }
 
   let safeTarget = rawUrl;
+  let targetHost = '';
+  let targetPort = 554;
+  let targetPath = '/';
   try {
     const parsed = new URL(rawUrl);
     safeTarget = `${parsed.protocol}//${parsed.host}${parsed.pathname}`;
+    targetHost = parsed.hostname;
+    targetPort = Number(parsed.port) || (parsed.protocol === 'http:' ? 80 : 554);
+    targetPath = parsed.pathname + parsed.search;
   } catch {
-    // Keep truncated fallback
+    // Keep fallback
   }
+
+  const startedAt = Date.now();
 
   if (rawUrl.startsWith('http://')) {
     const opId = processManager.startOperation('stream', safeTarget, { detail: 'HTTP MJPEG Proxy' });
@@ -1017,8 +1190,26 @@ app.get('/api/stream', async (req, res) => {
       const cleanUrl = `http://${parsed.host}${parsed.pathname}${parsed.search}`;
       const proxyRes = await fetchWithAuth(cleanUrl, { username: user, password: pass, timeoutMs: 8000 });
       if (!proxyRes.ok || !proxyRes.body) {
+        const diag = classifyStreamFailure(`HTTP ${proxyRes.status}`, {
+          host: targetHost,
+          port: targetPort,
+          path: targetPath,
+        });
+        diagnosticsManager.recordSample({
+          ip: targetHost || safeTarget,
+          feature: 'video',
+          status: 'error',
+          code: diag.code,
+          latencyMs: Date.now() - startedAt,
+          reason: diag.reason,
+          suggestion: diag.suggestion,
+        });
         processManager.completeOperation(opId, 'error', `HTTP ${proxyRes.status}`, proxyRes.status);
-        res.status(proxyRes.status || 502).end();
+        res.status(proxyRes.status || 502).json({
+          error: diag.reason,
+          code: diag.code,
+          suggestion: diag.suggestion,
+        });
         return;
       }
       res.writeHead(proxyRes.status, {
@@ -1042,24 +1233,26 @@ app.get('/api/stream', async (req, res) => {
       }
       res.end();
     } catch (err) {
-      processManager.completeOperation(
-        opId,
-        'error',
-        err instanceof Error ? err.message : 'Fallo HTTP stream',
-        1
-      );
-      if (!res.headersSent) res.status(502).end();
+      const msg = err instanceof Error ? err.message : 'Fallo HTTP stream';
+      const diag = classifyStreamFailure(msg, { host: targetHost, port: targetPort, path: targetPath });
+      diagnosticsManager.recordSample({
+        ip: targetHost || safeTarget,
+        feature: 'video',
+        status: 'error',
+        code: diag.code,
+        latencyMs: Date.now() - startedAt,
+        reason: diag.reason,
+        suggestion: diag.suggestion,
+      });
+      processManager.completeOperation(opId, 'error', msg, 1);
+      if (!res.headersSent) {
+        res.status(502).json({ error: diag.reason, code: diag.code, suggestion: diag.suggestion });
+      }
     }
     return;
   }
 
-  // RTSP -> MJPEG via ffmpeg with idle stall watchdog and ProcessManager tracking
-  res.writeHead(200, {
-    'Content-Type': 'multipart/x-mixed-replace; boundary=ffmpeg',
-    'Cache-Control': 'no-cache, no-store, must-revalidate',
-    Connection: 'close',
-  });
-
+  // RTSP -> MJPEG via ffmpeg: defer HTTP 200 headers until first decoded JPEG chunk so errors report real cause!
   const opId = processManager.startOperation('stream', safeTarget, { detail: 'RTSP → MJPEG (ffmpeg)' });
   const ff = spawn('ffmpeg', [
     '-rtsp_transport', 'tcp',
@@ -1073,31 +1266,106 @@ app.get('/api/stream', async (req, res) => {
   ]);
   processManager.attachChildProcess(opId, ff);
 
+  let headersSent = false;
+  let clientClosed = false;
+  let stderrLog = '';
   let idleTimer: ReturnType<typeof setTimeout> | null = null;
+
+  const startWatchdog = setTimeout(() => {
+    if (!headersSent) {
+      stderrLog = `${stderrLog}\nConnection timed out esperando primer frame`;
+      processManager.cancelOperation(opId, 'Timeout esperando primer frame (10s)');
+    }
+  }, 10000);
+
   const resetWatchdog = () => {
     if (idleTimer) clearTimeout(idleTimer);
     idleTimer = setTimeout(() => {
       processManager.cancelOperation(opId, 'Timeout sin frames (15s)');
     }, 15000);
   };
-  resetWatchdog();
+
+  ff.stderr.on('data', (chunk: Buffer) => {
+    stderrLog = (stderrLog + chunk.toString('utf8')).slice(-1200);
+  });
 
   ff.stdout.on('data', (chunk: Buffer) => {
+    if (!headersSent) {
+      clearTimeout(startWatchdog);
+      headersSent = true;
+      diagnosticsManager.recordSample({
+        ip: targetHost || safeTarget,
+        feature: 'video',
+        status: 'ok',
+        method: 'rtsp-mjpeg',
+        latencyMs: Date.now() - startedAt,
+        reason: `Stream RTSP conectado (${targetHost}:${targetPort}${targetPath}).`,
+      });
+      res.writeHead(200, {
+        'Content-Type': 'multipart/x-mixed-replace; boundary=ffmpeg',
+        'Cache-Control': 'no-cache, no-store, must-revalidate',
+        Connection: 'close',
+      });
+    }
     resetWatchdog();
     if (!res.writableEnded) res.write(chunk);
   });
 
-  ff.on('close', () => {
+  ff.on('close', (code) => {
+    clearTimeout(startWatchdog);
     if (idleTimer) clearTimeout(idleTimer);
+    if (!headersSent && !clientClosed) {
+      const diag = classifyStreamFailure(stderrLog || `ffmpeg exit ${code ?? 'unknown'}`, {
+        host: targetHost,
+        port: targetPort,
+        path: targetPath,
+      });
+      diagnosticsManager.recordSample({
+        ip: targetHost || safeTarget,
+        feature: 'video',
+        status: 'error',
+        code: diag.code,
+        latencyMs: Date.now() - startedAt,
+        reason: diag.reason,
+        suggestion: diag.suggestion,
+      });
+      if (!res.headersSent) {
+        res.status(502).json({ error: diag.reason, code: diag.code, suggestion: diag.suggestion });
+      }
+      return;
+    }
     if (!res.writableEnded) res.end();
   });
 
-  ff.on('error', () => {
+  ff.on('error', (err: NodeJS.ErrnoException) => {
+    clearTimeout(startWatchdog);
     if (idleTimer) clearTimeout(idleTimer);
+    if (!headersSent && !clientClosed) {
+      const diag = classifyStreamFailure(err.code || err.message || 'ffmpeg error', {
+        host: targetHost,
+        port: targetPort,
+        path: targetPath,
+      });
+      diagnosticsManager.recordSample({
+        ip: targetHost || safeTarget,
+        feature: 'video',
+        status: 'error',
+        code: diag.code,
+        latencyMs: Date.now() - startedAt,
+        reason: diag.reason,
+        suggestion: diag.suggestion,
+      });
+      if (!res.headersSent) {
+        res.status(502).json({ error: diag.reason, code: diag.code, suggestion: diag.suggestion });
+      }
+      return;
+    }
     if (!res.writableEnded) res.end();
   });
 
   req.on('close', () => {
+    clientClosed = true;
+    clearTimeout(startWatchdog);
     if (idleTimer) clearTimeout(idleTimer);
     processManager.cancelOperation(opId, 'Stream cerrado por cliente');
   });

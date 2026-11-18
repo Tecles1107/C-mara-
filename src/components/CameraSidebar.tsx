@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Camera, Plus, Search, SlidersHorizontal, X } from 'lucide-react';
+import { Camera, Globe, Plus, Search, SlidersHorizontal, Wifi, X } from 'lucide-react';
 import { CameraChannel, CameraProtocol, buildStreamUrl } from '../utils/cameraLogic';
 import { ScanProfile, formatLatency } from '../utils/processLogic';
 
@@ -10,6 +10,16 @@ export interface ScanProgressState {
   total: number;
   elapsedMs: number;
   foundCount: number;
+}
+
+export interface NearbyWifiInfo {
+  ssid: string;
+  bssid?: string;
+  signal?: number;
+  frequency?: string;
+  hidden: boolean;
+  cameraLikely: boolean;
+  source: string;
 }
 
 interface CameraSidebarProps {
@@ -24,6 +34,9 @@ interface CameraSidebarProps {
   customSubnet: string;
   customTimeoutMs: string;
   customConcurrency: string;
+  outOfNetworkScan: boolean;
+  externalTargets: string;
+  wifiNetworks: NearbyWifiInfo[];
   searchQuery: string;
   protocolFilter: CameraProtocol | 'ALL';
   onlyOnline: boolean;
@@ -35,6 +48,9 @@ interface CameraSidebarProps {
   onCustomSubnetChange: (val: string) => void;
   onCustomTimeoutChange: (val: string) => void;
   onCustomConcurrencyChange: (val: string) => void;
+  onOutOfNetworkScanChange: (enabled: boolean) => void;
+  onExternalTargetsChange: (val: string) => void;
+  onStartOutOfNetworkScan: () => void;
   onCancelScan: () => void;
   onSearchQueryChange: (val: string) => void;
   onProtocolFilterChange: (proto: CameraProtocol | 'ALL') => void;
@@ -66,6 +82,9 @@ export const CameraSidebar: React.FC<CameraSidebarProps> = ({
   customSubnet,
   customTimeoutMs,
   customConcurrency,
+  outOfNetworkScan,
+  externalTargets,
+  wifiNetworks,
   searchQuery,
   protocolFilter,
   onlyOnline,
@@ -77,6 +96,9 @@ export const CameraSidebar: React.FC<CameraSidebarProps> = ({
   onCustomSubnetChange,
   onCustomTimeoutChange,
   onCustomConcurrencyChange,
+  onOutOfNetworkScanChange,
+  onExternalTargetsChange,
+  onStartOutOfNetworkScan,
   onCancelScan,
   onSearchQueryChange,
   onProtocolFilterChange,
@@ -242,6 +264,79 @@ export const CameraSidebar: React.FC<CameraSidebarProps> = ({
                   className="w-full px-2 py-1 bg-slate-900 border border-slate-800 rounded text-xs font-mono text-slate-100 focus:outline-none focus:border-sky-500"
                 />
               </div>
+            </div>
+
+            <div className="pt-1.5 border-t border-slate-800/80 space-y-2">
+              <label className="flex items-start gap-2 text-xs text-slate-200 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={outOfNetworkScan}
+                  onChange={(e) => onOutOfNetworkScanChange(e.target.checked)}
+                  className="w-3.5 h-3.5 mt-0.5 accent-sky-500 rounded cursor-pointer shrink-0"
+                />
+                <span>
+                  Escanear fuera de la red (VPN Tailscale, rutas, AP de fábrica y Wi-Fi oculto)
+                </span>
+              </label>
+
+              <div>
+                <label htmlFor="external-targets-input" className="block text-[11px] text-slate-400 mb-1">
+                  IPs externas, rangos o DDNS
+                </label>
+                <input
+                  id="external-targets-input"
+                  type="text"
+                  placeholder="10.0.0.1-30, cam.duckdns.org:8554"
+                  value={externalTargets}
+                  onChange={(e) => onExternalTargetsChange(e.target.value)}
+                  className="w-full px-2.5 py-1.5 bg-slate-900 border border-slate-800 rounded text-xs font-mono text-slate-100 placeholder:text-slate-500 focus:outline-none focus:border-sky-500"
+                />
+              </div>
+
+              <button
+                type="button"
+                disabled={isScanning}
+                onClick={onStartOutOfNetworkScan}
+                className="w-full flex items-center justify-center gap-1.5 px-2.5 py-1.5 text-xs font-medium text-sky-200 bg-sky-950/60 border border-sky-800/70 hover:bg-sky-900/60 disabled:opacity-40 rounded transition-colors cursor-pointer"
+              >
+                <Globe className="w-3.5 h-3.5 text-sky-400" />
+                <span>Buscar fuera de la red ahora</span>
+              </button>
+            </div>
+          </div>
+        )}
+
+        {wifiNetworks.length > 0 && (
+          <div className="p-2.5 bg-slate-950 border border-slate-800 rounded-lg space-y-1.5">
+            <div className="flex items-center justify-between text-[11px] font-medium text-slate-300">
+              <span className="flex items-center gap-1.5">
+                <Wifi className="w-3.5 h-3.5 text-sky-400" />
+                <span>Wi-Fi / AP cercanos ({wifiNetworks.length})</span>
+              </span>
+              <span className="text-slate-500 font-mono">
+                {wifiNetworks.filter((n) => n.cameraLikely).length} cámaras/ocultas
+              </span>
+            </div>
+            <div className="max-h-28 overflow-y-auto divide-y divide-slate-800/60">
+              {wifiNetworks.slice(0, 8).map((net, idx) => (
+                <div
+                  key={`${net.bssid || net.ssid}-${idx}`}
+                  className="py-1 flex items-center justify-between gap-2 text-[11px]"
+                >
+                  <span
+                    className={`truncate font-mono ${
+                      net.hidden ? 'text-amber-300' : net.cameraLikely ? 'text-emerald-300' : 'text-slate-400'
+                    }`}
+                    title={net.bssid || net.ssid}
+                  >
+                    {net.ssid}
+                    {net.hidden ? ' (Oculta)' : ''}
+                  </span>
+                  <span className="text-slate-500 font-mono shrink-0">
+                    {net.signal !== undefined ? `${net.signal} dBm` : net.frequency || net.source}
+                  </span>
+                </div>
+              ))}
             </div>
           </div>
         )}

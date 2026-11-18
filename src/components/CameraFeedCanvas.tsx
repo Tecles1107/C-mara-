@@ -1,11 +1,14 @@
 import React, { useEffect, useRef, useState } from 'react';
+import { Activity, AlertTriangle, KeyRound, RefreshCw, SearchCheck } from 'lucide-react';
 import {
   CameraChannel,
   buildStreamUrl,
   calculateMotionScore,
   clampZoomPan,
   formatDuration,
+  resolveEffectiveEndpoint,
 } from '../utils/cameraLogic';
+import { DiagnosticSample } from '../utils/processLogic';
 
 export type VisionMode = 'normal' | 'night' | 'auto';
 
@@ -21,6 +24,10 @@ interface CameraFeedCanvasProps {
   onRecordingComplete?: (blob: Blob, durationSec: number) => void;
   snapshotTrigger?: number;
   compact?: boolean;
+  lastErrorDiagnostic?: DiagnosticSample | null;
+  onOpenCredentials?: () => void;
+  onRetryVerify?: () => void;
+  onOpenDiagnostics?: () => void;
 }
 
 export const CameraFeedCanvas: React.FC<CameraFeedCanvasProps> = ({
@@ -34,6 +41,11 @@ export const CameraFeedCanvas: React.FC<CameraFeedCanvasProps> = ({
   onMotionScore,
   onRecordingComplete,
   snapshotTrigger = 0,
+  compact = false,
+  lastErrorDiagnostic = null,
+  onOpenCredentials,
+  onRetryVerify,
+  onOpenDiagnostics,
 }) => {
   const imgRef = useRef<HTMLImageElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -50,16 +62,39 @@ export const CameraFeedCanvas: React.FC<CameraFeedCanvasProps> = ({
   const [recSeconds, setRecSeconds] = useState(0);
   const [streamError, setStreamError] = useState(false);
   const [retryCount, setRetryCount] = useState(0);
+  const [fetchedErrorSample, setFetchedErrorSample] = useState<DiagnosticSample | null>(null);
 
   const isNight =
     visionMode === 'night' ||
     (visionMode === 'auto' && (new Date().getHours() >= 19 || new Date().getHours() < 6));
-  const rawStreamUrl = buildStreamUrl(camera);
+  const endpoint = resolveEffectiveEndpoint(camera);
+  const rawStreamUrl = buildStreamUrl(camera, endpoint);
   const proxyUrl = `/api/stream?url=${encodeURIComponent(rawStreamUrl)}&r=${retryCount}`;
 
   useEffect(() => {
     setStreamError(false);
+    setFetchedErrorSample(null);
   }, [proxyUrl]);
+
+  // Fetch exact stream failure reason recorded by /api/stream whenever the <img> fails or camera is offline
+  useEffect(() => {
+    if (!streamError && camera.status !== 'offline') return;
+    let active = true;
+    const hostToCheck = endpoint.host || camera.ip;
+    fetch(`/api/diagnostics?ip=${encodeURIComponent(hostToCheck)}`)
+      .then((r) => (r.ok ? r.json() : null))
+      .then((data) => {
+        if (!active || !Array.isArray(data?.samples)) return;
+        const match = (data.samples as DiagnosticSample[]).find(
+          (s) => s.status !== 'ok' && (s.feature === 'video' || s.feature === 'verify')
+        );
+        if (match) setFetchedErrorSample(match);
+      })
+      .catch(() => {});
+    return () => {
+      active = false;
+    };
+  }, [streamError, camera.status, endpoint.host, camera.ip, retryCount]);
 
   // Snapshot photo download
   useEffect(() => {
@@ -162,6 +197,10 @@ export const CameraFeedCanvas: React.FC<CameraFeedCanvasProps> = ({
   const { zoom: safeZoom, panX: safePanX, panY: safePanY } = clampZoomPan(zoom, panX, panY);
 
   const handlePointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
+    const targetEl = e.target as HTMLElement | null;
+    if (targetEl?.closest('button, a, input, select')) {
+      return;
+    }
     e.currentTarget.setPointerCapture?.(e.pointerId);
     activePointersRef.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
 
@@ -214,6 +253,28 @@ export const CameraFeedCanvas: React.FC<CameraFeedCanvasProps> = ({
     }
   };
 
+  const activeDiagnostic =
+    fetchedErrorSample &&
+    (!lastErrorDiagnostic || fetchedErrorSample.timestamp >= lastErrorDiagnostic.timestamp)
+      ? fetchedErrorSample
+      : lastErrorDiagnostic;
+
+  const fallbackReason =
+    camera.authStatus === 'required' || camera.authStatus === 'failed'
+      ? 'La cámara requiere usuario y contraseña válidos para entregar video.'
+      : camera.status === 'offline'
+        ? `No se detectó respuesta TCP en ${endpoint.host}:${endpoint.port}. Puede estar en otra subred, apagada o con distinta IP.`
+        : `No se pudo abrir la ruta ${camera.streamPath} en ${endpoint.host}:${endpoint.port} (posible ruta RTSP distinta, credenciales o puerto bloqueado).`;
+
+  const fallbackSuggestion =
+    camera.authStatus === 'required' || camera.authStatus === 'failed'
+      ? 'Pulsa "Editar IP / Clave" para ingresar las credenciales.'
+      : 'Pulsa "Verificar ruta" para probar rutas RTSP comunes o "Escanear fuera de la red" si está en otra subred/VPN.';
+
+  const displayReason = activeDiagnostic?.reason || fallbackReason;
+  const displaySuggestion = activeDiagnostic?.suggestion || fallbackSuggestion;
+  const displayCode = activeDiagnostic?.code;
+
   return (
     <div
       className="relative w-full h-full overflow-hidden bg-slate-950 select-none flex items-center justify-center touch-none"
@@ -223,23 +284,83 @@ export const CameraFeedCanvas: React.FC<CameraFeedCanvasProps> = ({
       onPointerCancel={handlePointerUpOrCancel}
     >
       {camera.status === 'offline' || streamError ? (
-        <div className="text-center px-4 space-y-2">
-          <p className="text-sm font-mono font-semibold text-slate-400">
+        <div className={`text-center px-4 ${compact ? 'space-y-1.5 max-w-xs' : 'space-y-3 max-w-xl w-full'}`}>
+          <p className={`text-sm font-mono font-semibold ${camera.status === 'offline' ? 'text-amber-300' : 'text-red-300'}`}>
             {camera.status === 'offline' ? 'CÁMARA SIN SEÑAL' : 'NO SE PUDO CONECTAR AL STREAM'}
           </p>
-          <p className="text-xs font-mono text-slate-500 break-all">{camera.ip}:{camera.port}{camera.streamPath}</p>
-          {streamError && camera.status === 'online' && (
+          <p className="text-xs font-mono text-slate-400 break-all">
+            {endpoint.host}:{endpoint.port}{camera.streamPath}
+            {endpoint.isRemote ? ' · Remoto' : ''}
+          </p>
+
+          {!compact ? (
+            <div className="bg-slate-900/90 border border-slate-800 rounded-lg p-3 text-left space-y-1.5">
+              <div className="flex items-start gap-2 text-xs text-slate-200">
+                <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+                <div className="min-w-0 space-y-1">
+                  <div className="font-medium text-slate-100 flex flex-wrap items-center gap-1.5">
+                    <span>Motivo detectado</span>
+                    {displayCode && (
+                      <span className="px-1.5 py-0.5 text-[10px] font-mono bg-slate-950 border border-slate-700 text-amber-300 rounded">
+                        {displayCode}
+                      </span>
+                    )}
+                  </div>
+                  <p className="text-xs text-slate-300 leading-relaxed">{displayReason}</p>
+                  <p className="text-[11px] text-sky-300/90 leading-relaxed">{displaySuggestion}</p>
+                </div>
+              </div>
+            </div>
+          ) : (
+            <p className="text-[11px] text-slate-400 line-clamp-2">{displayReason}</p>
+          )}
+
+          <div className="flex flex-wrap items-center justify-center gap-2 pt-0.5">
             <button
               type="button"
               onClick={() => {
                 setStreamError(false);
                 setRetryCount((n) => n + 1);
               }}
-              className="px-3 py-1.5 text-xs font-medium text-sky-300 bg-slate-900 border border-slate-700 hover:bg-slate-800 rounded-md cursor-pointer"
+              className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium text-sky-300 bg-slate-900 border border-slate-700 hover:bg-slate-800 rounded-md cursor-pointer transition-colors"
             >
-              Reintentar conexión
+              <RefreshCw className="w-3.5 h-3.5" />
+              <span>Reintentar conexión</span>
             </button>
-          )}
+
+            {!compact && onRetryVerify && (
+              <button
+                type="button"
+                onClick={onRetryVerify}
+                className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium text-emerald-300 bg-slate-900 border border-slate-700 hover:bg-slate-800 rounded-md cursor-pointer transition-colors"
+              >
+                <SearchCheck className="w-3.5 h-3.5" />
+                <span>Verificar ruta</span>
+              </button>
+            )}
+
+            {!compact && onOpenCredentials && (
+              <button
+                type="button"
+                onClick={onOpenCredentials}
+                className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium text-amber-200 bg-slate-900 border border-slate-700 hover:bg-slate-800 rounded-md cursor-pointer transition-colors"
+              >
+                <KeyRound className="w-3.5 h-3.5" />
+                <span>Editar IP / Clave</span>
+              </button>
+            )}
+
+            {!compact && onOpenDiagnostics && (
+              <button
+                type="button"
+                onClick={onOpenDiagnostics}
+                className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium text-slate-200 bg-slate-900 border border-slate-700 hover:bg-slate-800 rounded-md cursor-pointer transition-colors"
+              >
+                <Activity className="w-3.5 h-3.5 text-sky-400" />
+                <span>Diagnóstico</span>
+              </button>
+            )}
+          </div>
         </div>
       ) : (
         <>

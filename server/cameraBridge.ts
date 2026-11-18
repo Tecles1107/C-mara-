@@ -1096,7 +1096,15 @@ export async function discoverArpNeighbors(): Promise<Array<{ ip: string; mac?: 
     if (!/^\d+\.\d+\.\d+\.\d+$/.test(ip)) return;
     if (localIps.has(ip) || seen.has(ip)) return;
     const octets = ip.split('.').map(Number);
-    if (octets[0] === 127 || octets[0] >= 224 || octets[3] === 0 || octets[3] === 255) return;
+    if (
+      octets[0] === 127 ||
+      octets[0] >= 224 ||
+      (octets[0] === 169 && octets[1] === 254) ||
+      octets[3] === 0 ||
+      octets[3] === 255
+    ) {
+      return;
+    }
     seen.add(ip);
     results.push({ ip, mac });
   };
@@ -1284,4 +1292,228 @@ export function discoverVendorUdpCameras(timeoutMs = 1100): Promise<Array<{ ip: 
       resolve(found);
     }, timeoutMs);
   });
+}
+
+export interface NearbyWifiNetwork {
+  ssid: string;
+  bssid?: string;
+  signal?: number;
+  frequency?: string;
+  hidden: boolean;
+  cameraLikely: boolean;
+  source: string;
+}
+
+export interface RouteVpnDiscoveryResult {
+  subnets: string[];
+  vpnHosts: Array<{ ip: string; name?: string; source: 'tailscale' | 'route' }>;
+  gateways: string[];
+  routesSummary: string[];
+}
+
+export const COMMON_OUT_OF_NETWORK_CAMERA_IPS: string[] = [
+  // Camera Wi-Fi AP & hotspot defaults (ESP32-CAM, V380, HDWiFiCam, Android/Wi-Fi Direct)
+  '192.168.4.1',
+  '192.168.4.2',
+  '192.168.10.1',
+  '192.168.42.1',
+  '192.168.43.1',
+  '192.168.49.1',
+  '192.168.137.1',
+  '192.168.169.1',
+  '10.10.10.1',
+  '10.10.0.1',
+  '172.16.0.1',
+  '172.20.10.1',
+  // Common factory static defaults (Hikvision, Dahua, Reolink, Foscam, XMeye)
+  '192.168.1.64',
+  '192.168.1.108',
+  '192.168.1.10',
+  '192.168.1.100',
+  '192.168.1.200',
+  '192.168.0.64',
+  '192.168.0.108',
+  '192.168.0.100',
+  '192.168.0.120',
+];
+
+export function isCameraLikeSsid(ssid: string): boolean {
+  const lower = (ssid || '').toLowerCase();
+  if (!lower) return false;
+  return /(ipc|ipcam|cam|camera|v380|icsee|xmeye|tuya|smartlife|hik|dahua|reolink|esp|ezviz|tapo|imou|hdwifi|mv\d|yi_|ap_|wifi[-_]?cam)/i.test(
+    lower
+  );
+}
+
+export async function discoverNearbyWifiNetworks(): Promise<NearbyWifiNetwork[]> {
+  const found: NearbyWifiNetwork[] = [];
+  const seen = new Set<string>();
+
+  const pushNet = (net: NearbyWifiNetwork) => {
+    const key = net.bssid ? `${net.bssid}` : `${net.ssid}:${net.frequency || ''}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    found.push(net);
+  };
+
+  // 1. Termux API (Android)
+  try {
+    const { stdout } = await execFileAsync('termux-wifi-scaninfo', [], { timeout: 2500 });
+    const parsed = JSON.parse(stdout);
+    if (Array.isArray(parsed)) {
+      for (const item of parsed) {
+        const ssid = typeof item.ssid === 'string' ? item.ssid.trim() : '';
+        const hidden = !ssid || ssid === '<unknown ssid>';
+        pushNet({
+          ssid: hidden ? 'Red Wi-Fi Oculta' : ssid,
+          bssid: typeof item.bssid === 'string' ? item.bssid : undefined,
+          signal: typeof item.rssi === 'number' ? item.rssi : undefined,
+          frequency: item.frequency_mhz ? `${item.frequency_mhz} MHz` : undefined,
+          hidden,
+          cameraLikely: hidden || isCameraLikeSsid(ssid),
+          source: 'termux-wifi',
+        });
+      }
+    }
+  } catch {
+    // termux-wifi-scaninfo unavailable
+  }
+
+  // 2. NetworkManager nmcli (Linux)
+  if (found.length === 0) {
+    try {
+      const { stdout } = await execFileAsync(
+        'nmcli',
+        ['-t', '-f', 'SSID,BSSID,SIGNAL,FREQ', 'dev', 'wifi', 'list'],
+        { timeout: 2500 }
+      );
+      for (const line of stdout.split('\n')) {
+        if (!line.trim()) continue;
+        // nmcli -t escapes ':' inside BSSID as '\:'
+        const parts = line.replace(/\\:/g, '|').split(':');
+        if (parts.length < 2) continue;
+        const rawSsid = (parts[0] || '').trim();
+        const bssid = (parts[1] || '').replace(/\|/g, ':').trim() || undefined;
+        const signal = parts[2] ? Number(parts[2]) : undefined;
+        const freq = parts[3]?.trim() || undefined;
+        const hidden = !rawSsid || rawSsid === '--';
+        pushNet({
+          ssid: hidden ? 'Red Wi-Fi Oculta' : rawSsid,
+          bssid,
+          signal: Number.isFinite(signal) ? signal : undefined,
+          frequency: freq,
+          hidden,
+          cameraLikely: hidden || isCameraLikeSsid(rawSsid),
+          source: 'nmcli',
+        });
+      }
+    } catch {
+      // nmcli unavailable
+    }
+  }
+
+  // 3. Sort camera-like and hidden APs first, then strongest signal
+  return found.sort((a, b) => {
+    if (a.cameraLikely !== b.cameraLikely) return a.cameraLikely ? -1 : 1;
+    if (a.hidden !== b.hidden) return a.hidden ? -1 : 1;
+    return (b.signal ?? -100) - (a.signal ?? -100);
+  });
+}
+
+export async function discoverRouteAndVpnTargets(): Promise<RouteVpnDiscoveryResult> {
+  const localIps = new Set(getAllLocalIPv4Addresses().map((i) => i.address));
+  const localSubnets = new Set(getAllLocalIPv4Addresses().map((i) => i.subnet));
+  const externalSubnets = new Set<string>();
+  const gateways = new Set<string>();
+  const vpnHosts: Array<{ ip: string; name?: string; source: 'tailscale' | 'route' }> = [];
+  const seenHosts = new Set<string>();
+  const routesSummary: string[] = [];
+
+  const addHost = (ip: string, source: 'tailscale' | 'route', name?: string) => {
+    if (!/^\d+\.\d+\.\d+\.\d+$/.test(ip) || localIps.has(ip) || seenHosts.has(ip)) return;
+    const octets = ip.split('.').map(Number);
+    if (octets[0] === 127 || octets[0] >= 224 || octets[3] === 0 || octets[3] === 255) return;
+    seenHosts.add(ip);
+    vpnHosts.push({ ip, name, source });
+  };
+
+  // 1. Parse Linux / Android routing table (`ip route show`)
+  try {
+    const { stdout } = await execFileAsync('ip', ['route', 'show'], { timeout: 1500 });
+    for (const line of stdout.split('\n')) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      routesSummary.push(trimmed);
+
+      const viaMatch = trimmed.match(/via\s+(\d+\.\d+\.\d+\.\d+)/);
+      if (viaMatch) {
+        gateways.add(viaMatch[1]);
+        addHost(viaMatch[1], 'route', 'Gateway / Router');
+      }
+
+      const cidrMatch = trimmed.match(/^(\d+\.\d+\.\d+)\.0\/(24|16|23|22|20|10)\b/);
+      if (cidrMatch) {
+        const subnet = cidrMatch[1];
+        if (!subnet.startsWith('127.') && !subnet.startsWith('169.254.') && !localSubnets.has(subnet)) {
+          externalSubnets.add(subnet);
+        }
+      }
+    }
+  } catch {
+    // Fallback to /proc/net/route
+    try {
+      const routeText = await fs.readFile('/proc/net/route', 'utf8');
+      for (const line of routeText.split('\n').slice(1)) {
+        const cols = line.trim().split(/\s+/);
+        if (cols.length < 3) continue;
+        const hexDest = cols[1];
+        const hexGw = cols[2];
+        if (hexGw && hexGw !== '00000000' && hexGw.length === 8) {
+          const gw = [
+            parseInt(hexGw.slice(6, 8), 16),
+            parseInt(hexGw.slice(4, 6), 16),
+            parseInt(hexGw.slice(2, 4), 16),
+            parseInt(hexGw.slice(0, 2), 16),
+          ].join('.');
+          gateways.add(gw);
+          addHost(gw, 'route', 'Gateway');
+        }
+        if (hexDest && hexDest !== '00000000' && hexDest.length === 8) {
+          const b0 = parseInt(hexDest.slice(6, 8), 16);
+          const b1 = parseInt(hexDest.slice(4, 6), 16);
+          const b2 = parseInt(hexDest.slice(2, 4), 16);
+          const subnet = `${b0}.${b1}.${b2}`;
+          if (b0 !== 127 && b0 < 224 && !(b0 === 169 && b1 === 254) && !localSubnets.has(subnet)) {
+            externalSubnets.add(subnet);
+          }
+        }
+      }
+    } catch {
+      // Ignore
+    }
+  }
+
+  // 2. Parse Tailscale Mesh VPN peers (`tailscale status --json`)
+  try {
+    const { stdout } = await execFileAsync('tailscale', ['status', '--json'], { timeout: 2000 });
+    const parsed = JSON.parse(stdout);
+    const peers = parsed?.Peer ? Object.values(parsed.Peer) : [];
+    for (const peer of peers as Array<{ TailscaleIPs?: string[]; HostName?: string; Online?: boolean }>) {
+      if (peer.Online === false) continue;
+      for (const ip of peer.TailscaleIPs || []) {
+        if (/^\d+\.\d+\.\d+\.\d+$/.test(ip)) {
+          addHost(ip, 'tailscale', peer.HostName || 'Tailscale Peer');
+        }
+      }
+    }
+  } catch {
+    // Tailscale not installed or not running
+  }
+
+  return {
+    subnets: Array.from(externalSubnets),
+    vpnHosts,
+    gateways: Array.from(gateways),
+    routesSummary: routesSummary.slice(0, 10),
+  };
 }
