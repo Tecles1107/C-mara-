@@ -1,30 +1,64 @@
 import express from 'express';
 import { createServer as createViteServer } from 'vite';
+import http from 'node:http';
 import net from 'node:net';
 import dgram from 'node:dgram';
-import { spawn } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
+import { promisify } from 'node:util';
 import path from 'node:path';
 import {
+  buildCandidateHttpPorts,
+  discoverArpNeighbors,
+  discoverMdnsCameras,
   discoverSsdpDevices,
+  discoverVendorUdpCameras,
   fetchWithAuth,
   getAllLocalIPv4Addresses,
   moveOnvifOrCgiPtz,
   probeMediaStream,
   resolveOnvifProfile,
+  sendHttpTwoWayAudio,
+  setCameraIrMode,
   toggleCameraLight,
 } from './server/cameraBridge.ts';
+import { diagnosticsManager } from './server/diagnosticsManager.ts';
 import { processManager } from './server/processManager.ts';
-import { parseSubnetInputs, type CameraChannel } from './src/utils/cameraLogic.ts';
+import { probeRtspBackchannel, rtspBackchannelPool } from './server/rtspBackchannel.ts';
+import { savedCamerasStore } from './server/savedCamerasStore.ts';
+import {
+  parseSubnetInputs,
+  type CameraChannel,
+  type ConnectionMode,
+} from './src/utils/cameraLogic.ts';
 import {
   getScanConfigForProfile,
   runWithConcurrency,
+  type CapabilityCheckItem,
   type ScanProfile,
 } from './src/utils/processLogic.ts';
+
+const execFileAsync = promisify(execFile);
 
 const app = express();
 app.use(express.json({ limit: '4mb' }));
 
-const PORT = Number(process.env.PORT) || 3000;
+function resolveListenPort(): number {
+  const portFlagIdx = process.argv.findIndex((a) => a === '--port' || a.startsWith('--port='));
+  if (portFlagIdx !== -1) {
+    const arg = process.argv[portFlagIdx];
+    const val = arg.includes('=') ? arg.split('=')[1] : process.argv[portFlagIdx + 1];
+    const parsed = Number(val);
+    if (Number.isInteger(parsed) && parsed > 0) return parsed;
+  }
+  const envPort = Number(process.env.PORT);
+  const nginxPort = Number(process.env.NGINX_PORT);
+  if (envPort > 0 && nginxPort > 0 && envPort === nginxPort) {
+    return Number(process.env.DEFAULT_APP_PORT) || 3000;
+  }
+  return envPort > 0 ? envPort : 3000;
+}
+
+const PORT = resolveListenPort();
 
 function probePortWithLatency(
   ip: string,
@@ -317,19 +351,38 @@ async function executeNetworkScan(params: {
 
   const found: CameraChannel[] = [];
   const seenKeys = new Set<string>();
+  const portsByIp = new Map<string, Set<number>>();
+  const recordIpPort = (ip: string, p?: number) => {
+    if (!p || p <= 0) return;
+    let set = portsByIp.get(ip);
+    if (!set) {
+      set = new Set<number>();
+      portsByIp.set(ip, set);
+    }
+    set.add(p);
+    for (const existing of found) {
+      if (existing.ip === ip) {
+        existing.openPorts = Array.from(set);
+      }
+    }
+  };
   const pushCamera = (cam: CameraChannel) => {
+    recordIpPort(cam.ip, cam.port);
+    recordIpPort(cam.ip, cam.onvifPort);
     const key = `${cam.ip}:${cam.port}`;
     if (seenKeys.has(key)) return;
     seenKeys.add(key);
+    const ipPorts = portsByIp.get(cam.ip);
+    cam.openPorts = ipPorts ? Array.from(ipPorts) : [cam.port];
     found.push(cam);
     onCamera?.(cam);
   };
 
   onProgress?.({
     stage: 'discovery',
-    label: 'Descubrimiento ONVIF WS-Discovery y SSDP',
+    label: 'Descubrimiento ONVIF, SSDP, mDNS, UDP fabricantes y ARP',
     completed: 0,
-    total: 2,
+    total: 5,
     elapsedMs: Date.now() - startedAt,
     foundCount: found.length,
   });
@@ -337,17 +390,39 @@ async function executeNetworkScan(params: {
   const ssdpOpId = processManager.startOperation('ssdp', '239.255.255.250:1900', {
     detail: 'M-SEARCH ssdp:all',
   });
+  const mdnsOpId = processManager.startOperation('mdns', '224.0.0.251:5353', {
+    detail: 'mDNS _rtsp/_onvif/_http',
+  });
+  const vendorUdpOpId = processManager.startOperation('vendor-udp', '34569,37810,37020', {
+    detail: 'XMeye / Dahua / Hikvision SADP',
+  });
+  const arpOpId = processManager.startOperation('arp', 'Tabla ARP local', {
+    detail: 'ip neigh / /proc/net/arp',
+  });
 
-  const [onvifFound, ssdpFound] = await Promise.all([
+  const [onvifFound, ssdpFound, mdnsFound, vendorUdpFound, arpFound] = await Promise.all([
     discoverOnvifDevices(1100, controller.signal),
     discoverSsdpDevices(1000).then((items) => {
       processManager.completeOperation(ssdpOpId, 'completed', `${items.length} respuestas SSDP`, 0);
+      return items;
+    }),
+    discoverMdnsCameras(1000).then((items) => {
+      processManager.completeOperation(mdnsOpId, 'completed', `${items.length} servicios mDNS`, 0);
+      return items;
+    }),
+    discoverVendorUdpCameras(1000).then((items) => {
+      processManager.completeOperation(vendorUdpOpId, 'completed', `${items.length} respuestas UDP`, 0);
+      return items;
+    }),
+    discoverArpNeighbors().then((items) => {
+      processManager.completeOperation(arpOpId, 'completed', `${items.length} vecinos ARP`, 0);
       return items;
     }),
   ]);
 
   for (const cam of onvifFound) pushCamera(cam);
   for (const s of ssdpFound) {
+    recordIpPort(s.ip, s.port);
     pushCamera({
       id: `ssdp-${s.ip.replace(/\./g, '-')}-${s.port}`,
       name: s.server ? `${s.server.split('/')[0]} (${s.ip})` : `Cámara SSDP ${s.ip}`,
@@ -366,6 +441,45 @@ async function executeNetworkScan(params: {
       capabilities: { ptz: true, audio: true, light: true, twoWayAudio: true },
     });
   }
+  for (const m of mdnsFound) {
+    recordIpPort(m.ip, m.port);
+    pushCamera({
+      id: `mdns-${m.ip.replace(/\./g, '-')}-${m.port}`,
+      name: `${m.serviceName} (${m.ip})`,
+      ip: m.ip,
+      port: m.port === 80 ? 554 : m.port,
+      onvifPort: m.port === 80 ? 80 : undefined,
+      protocol: m.port === 554 ? 'RTSP' : 'ONVIF',
+      streamPath: '/live/ch00_0',
+      status: 'online',
+      resolution: 'Auto',
+      fps: 25,
+      hasAudio: true,
+      location: 'mDNS Multicast',
+      nightVision: false,
+      authStatus: 'unknown',
+      capabilities: { ptz: true, audio: true, light: true, twoWayAudio: true },
+    });
+  }
+  for (const v of vendorUdpFound) {
+    pushCamera({
+      id: `udp-${v.ip.replace(/\./g, '-')}-${v.port}`,
+      name: `${v.vendor} (${v.ip})`,
+      ip: v.ip,
+      port: v.port,
+      protocol: v.protocol,
+      streamPath: '/live/ch00_0',
+      status: 'online',
+      resolution: 'Auto',
+      fps: 25,
+      hasAudio: true,
+      manufacturer: v.vendor,
+      location: `UDP ${v.vendor}`,
+      nightVision: false,
+      authStatus: 'unknown',
+      capabilities: { ptz: true, audio: true, light: true, twoWayAudio: true },
+    });
+  }
 
   const allTargets: Array<{
     subnet: string;
@@ -374,6 +488,22 @@ async function executeNetworkScan(params: {
     protocol: CameraChannel['protocol'];
     defaultPath: string;
   }> = [];
+  const scheduledTargetSet = new Set<string>();
+  const addTarget = (subnet: string, ip: string, port: number) => {
+    const tk = `${ip}:${port}`;
+    if (scheduledTargetSet.has(tk)) return;
+    scheduledTargetSet.add(tk);
+    const meta = getPortMeta(port);
+    allTargets.push({ subnet, ip, port, ...meta });
+  };
+
+  for (const neighbor of arpFound) {
+    const parts = neighbor.ip.split('.');
+    const nSubnet = `${parts[0]}.${parts[1]}.${parts[2]}`;
+    for (const port of config.ports) {
+      addTarget(nSubnet, neighbor.ip, port);
+    }
+  }
 
   for (const subnet of subnets) {
     if (controller.signal.aborted) break;
@@ -393,8 +523,7 @@ async function executeNetworkScan(params: {
     for (let host = 1; host <= 254; host++) {
       const ip = `${subnet}.${host}`;
       for (const port of config.ports) {
-        const meta = getPortMeta(port);
-        allTargets.push({ subnet, ip, port, ...meta });
+        addTarget(subnet, ip, port);
       }
     }
   }
@@ -414,12 +543,14 @@ async function executeNetworkScan(params: {
       allTargets,
       config.concurrency,
       async (t) => {
+        const probe = await probePortWithLatency(t.ip, t.port, config.connectTimeoutMs);
+        if (!probe.open) return null;
+        recordIpPort(t.ip, t.port);
+
         const targetPort = t.protocol === 'ONVIF' ? 554 : t.port;
         if (seenKeys.has(`${t.ip}:${targetPort}`)) {
           return null;
         }
-        const probe = await probePortWithLatency(t.ip, t.port, config.connectTimeoutMs);
-        if (!probe.open) return null;
 
         const cam: CameraChannel = {
           id: `cam-${t.ip.replace(/\./g, '-')}-${t.port}`,
@@ -574,37 +705,156 @@ app.post('/api/processes/:id/kill', (req, res) => {
   res.json({ ok });
 });
 
-// Verify camera connectivity, latency, credentials, ONVIF profiles, and auto-detect working stream path
-app.post('/api/verify-camera', async (req, res) => {
-  const { ip, port = 554, onvifPort, protocol = 'RTSP', streamPath = '/live/ch00_0', username, password } =
-    req.body as {
-      ip?: string;
-      port?: number;
-      onvifPort?: number;
-      protocol?: CameraChannel['protocol'];
-      streamPath?: string;
-      username?: string;
-      password?: string;
-    };
+// Saved Devices & Remote Connection Persistence API
+app.get('/api/saved-cameras', (_req, res) => {
+  res.json({ cameras: savedCamerasStore.list() });
+});
 
-  if (!ip) {
-    res.status(400).json({ ok: false, error: 'Falta la IP de la cámara' });
+app.post('/api/saved-cameras', (req, res) => {
+  const cam = req.body as CameraChannel;
+  if (!cam || !cam.ip) {
+    res.status(400).json({ ok: false, error: 'Datos de cámara inválidos' });
+    return;
+  }
+  const cameras = savedCamerasStore.upsert(cam);
+  res.json({ ok: true, cameras });
+});
+
+app.put('/api/saved-cameras/:id', (req, res) => {
+  const cam = { ...(req.body as CameraChannel), id: req.params.id };
+  if (!cam.ip) {
+    res.status(400).json({ ok: false, error: 'Falta IP de la cámara' });
+    return;
+  }
+  const cameras = savedCamerasStore.upsert(cam);
+  res.json({ ok: true, cameras });
+});
+
+app.delete('/api/saved-cameras/:id', (req, res) => {
+  const result = savedCamerasStore.remove(req.params.id);
+  res.json({ ok: true, ...result });
+});
+
+async function hasBinary(cmd: string): Promise<boolean> {
+  try {
+    await execFileAsync('which', [cmd], { timeout: 1200 });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+app.get('/api/network-info', async (_req, res) => {
+  const interfaces = getAllLocalIPv4Addresses();
+  const [ffmpeg, nmap, cloudflared, tailscale] = await Promise.all([
+    hasBinary('ffmpeg'),
+    hasBinary('nmap'),
+    hasBinary('cloudflared'),
+    hasBinary('tailscale'),
+  ]);
+  res.json({
+    port: PORT,
+    interfaces,
+    tools: { ffmpeg, nmap, cloudflared, tailscale },
+  });
+});
+
+// Verify camera connectivity (local + remote DDNS/VPN fallback), latency, credentials, ONVIF profiles & stream path
+app.post('/api/verify-camera', async (req, res) => {
+  const {
+    ip,
+    port = 554,
+    onvifPort,
+    remoteHost,
+    remotePort,
+    remoteOnvifPort,
+    connectionMode = 'auto',
+    protocol = 'RTSP',
+    streamPath = '/live/ch00_0',
+    username,
+    password,
+  } = req.body as {
+    ip?: string;
+    port?: number;
+    onvifPort?: number;
+    remoteHost?: string;
+    remotePort?: number;
+    remoteOnvifPort?: number;
+    connectionMode?: ConnectionMode;
+    protocol?: CameraChannel['protocol'];
+    streamPath?: string;
+    username?: string;
+    password?: string;
+  };
+
+  if (!ip && !remoteHost) {
+    res.status(400).json({ ok: false, error: 'Falta la IP o host de la cámara' });
     return;
   }
 
-  const verifyOpId = processManager.startOperation('verify', `${ip}:${port}`, {
-    detail: `Verificando ${protocol}`,
-  });
+  const cleanRemote = remoteHost?.trim();
+  const targetLocalHost = ip || cleanRemote!;
+  const targetLocalPort = Number(port) || 554;
+  const targetRemoteHost = cleanRemote || '';
+  const targetRemotePort = Number(remotePort) || targetLocalPort;
+
+  const verifyOpId = processManager.startOperation(
+    'verify',
+    connectionMode === 'remote' && targetRemoteHost
+      ? `${targetRemoteHost}:${targetRemotePort}`
+      : `${targetLocalHost}:${targetLocalPort}`,
+    { detail: `Verificando ${protocol} (${connectionMode})` }
+  );
 
   try {
-    const tcpProbe = await probePortWithLatency(ip, Number(port), 1200);
+    let activeEndpoint: 'local' | 'remote' = 'local';
+    let activeHost = targetLocalHost;
+    let activePort = targetLocalPort;
+    let activeOnvifPort = onvifPort;
+    let tcpProbe: { open: boolean; latencyMs?: number } = { open: false };
+
+    if (connectionMode === 'remote' && targetRemoteHost) {
+      activeEndpoint = 'remote';
+      activeHost = targetRemoteHost;
+      activePort = targetRemotePort;
+      activeOnvifPort = remoteOnvifPort || onvifPort;
+      tcpProbe = await probePortWithLatency(activeHost, activePort, 1600);
+    } else {
+      tcpProbe = await probePortWithLatency(targetLocalHost, targetLocalPort, 1200);
+      if (!tcpProbe.open && connectionMode === 'auto' && targetRemoteHost) {
+        const remoteProbe = await probePortWithLatency(targetRemoteHost, targetRemotePort, 1600);
+        if (remoteProbe.open) {
+          activeEndpoint = 'remote';
+          activeHost = targetRemoteHost;
+          activePort = targetRemotePort;
+          activeOnvifPort = remoteOnvifPort || onvifPort;
+          tcpProbe = remoteProbe;
+        }
+      }
+    }
+
     const reachable = tcpProbe.open;
+    const candidateHttpPorts = buildCandidateHttpPorts(activePort, activeOnvifPort);
+    const openHttpProbes = await Promise.all(
+      candidateHttpPorts.slice(0, 6).map(async (hp) => ({
+        port: hp,
+        ...(await probePortWithLatency(activeHost, hp, 550)),
+      }))
+    );
+    const openPorts = Array.from(
+      new Set([
+        ...(reachable ? [activePort] : []),
+        ...openHttpProbes.filter((p) => p.open).map((p) => p.port),
+      ])
+    );
+
     const onvifProfile = await resolveOnvifProfile(
-      ip,
-      onvifPort || (Number(port) !== 554 ? Number(port) : undefined),
+      activeHost,
+      activeOnvifPort || (activePort !== 554 ? activePort : undefined),
       username,
       password,
-      true
+      true,
+      openPorts
     );
 
     let resolvedPath = streamPath;
@@ -644,7 +894,7 @@ app.post('/api/verify-camera', async (req, res) => {
 
     if (scheme === 'rtsp') {
       for (const candidatePath of pathsToTry.slice(0, 6)) {
-        const url = `${scheme}://${authSegment}${ip}:${port}${candidatePath}`;
+        const url = `${scheme}://${authSegment}${activeHost}:${activePort}${candidatePath}`;
         const r = await probeMediaStream(url);
         if (r.ok) {
           resolvedPath = candidatePath;
@@ -658,7 +908,7 @@ app.post('/api/verify-camera', async (req, res) => {
       }
     } else {
       try {
-        const r = await fetchWithAuth(`http://${ip}:${port}${resolvedPath}`, {
+        const r = await fetchWithAuth(`http://${activeHost}:${activePort}${resolvedPath}`, {
           method: 'GET',
           username,
           password,
@@ -684,13 +934,35 @@ app.post('/api/verify-camera', async (req, res) => {
     processManager.completeOperation(
       verifyOpId,
       ok ? 'completed' : 'error',
-      `${authStatus}${tcpProbe.latencyMs ? ` · ${tcpProbe.latencyMs}ms` : ''}`,
+      `${activeEndpoint === 'remote' ? 'Remoto · ' : ''}${authStatus}${tcpProbe.latencyMs ? ` · ${tcpProbe.latencyMs}ms` : ''}`,
       ok ? 0 : 1
     );
+
+    diagnosticsManager.recordSample({
+      ip: activeHost,
+      feature: 'verify',
+      status: probeResult.authError ? 'warn' : ok ? 'ok' : 'error',
+      method: onvifProfile ? `ONVIF:${onvifProfile.onvifPort}` : `${protocol}:${activePort}`,
+      latencyMs: tcpProbe.latencyMs,
+      reason: probeResult.authError
+        ? 'Autenticación rechazada o requerida (401)'
+        : ok
+          ? `Conectividad verificada (puertos abiertos: ${openPorts.join(', ') || activePort})`
+          : `Sin respuesta TCP ni ONVIF en ${activeHost}:${activePort}`,
+      suggestion: probeResult.authError
+        ? 'Verifica usuario y contraseña RTSP/ONVIF en Editar / Red.'
+        : !ok
+          ? 'Revisa la IP, subred o configura Host Remoto (Tailscale / DDNS).'
+          : undefined,
+    });
 
     res.json({
       ok,
       reachable,
+      activeEndpoint,
+      activeHost,
+      activePort,
+      openPorts,
       latencyMs: tcpProbe.latencyMs,
       authStatus,
       resolvedStreamPath: resolvedPath,
@@ -710,6 +982,12 @@ app.post('/api/verify-camera', async (req, res) => {
       err instanceof Error ? err.message : 'Fallo de verificación',
       1
     );
+    diagnosticsManager.recordSample({
+      ip: targetLocalHost,
+      feature: 'verify',
+      status: 'error',
+      reason: err instanceof Error ? err.message : 'Error interno verificando cámara',
+    });
     res.status(500).json({ ok: false, error: 'Error interno verificando cámara' });
   }
 });
@@ -834,18 +1112,22 @@ app.get('/api/audio', (req, res) => {
   }
 
   let safeTarget = rawUrl;
+  let targetIp = String(req.query.ip || '');
   try {
     const parsed = new URL(rawUrl);
     safeTarget = `${parsed.protocol}//${parsed.host}${parsed.pathname}`;
+    if (!targetIp) targetIp = parsed.hostname;
   } catch {
     // Keep fallback
   }
 
+  const startedAt = Date.now();
   const opId = processManager.startOperation('audio', safeTarget, { detail: 'Audio PCM WAV (ffmpeg)' });
   const ff = spawn('ffmpeg', [
     '-rtsp_transport', 'tcp',
-    '-probesize', '32768',
-    '-analyzeduration', '500000',
+    '-probesize', '512000',
+    '-analyzeduration', '1500000',
+    '-err_detect', 'ignore_err',
     '-i', rawUrl,
     '-vn',
     '-acodec', 'pcm_s16le',
@@ -861,18 +1143,26 @@ app.get('/api/audio', (req, res) => {
 
   const startWatchdog = setTimeout(() => {
     if (!headersSent) {
-      processManager.cancelOperation(opId, 'Sin audio tras 8s');
+      processManager.cancelOperation(opId, 'Sin audio tras 9s');
     }
-  }, 8000);
+  }, 9000);
 
   ff.stderr.on('data', (chunk: Buffer) => {
-    stderrLog += chunk.toString('utf8').slice(-400);
+    stderrLog = (stderrLog + chunk.toString('utf8')).slice(-800);
   });
 
   ff.stdout.on('data', (chunk: Buffer) => {
     if (!headersSent) {
       clearTimeout(startWatchdog);
       headersSent = true;
+      diagnosticsManager.recordSample({
+        ip: targetIp || safeTarget,
+        feature: 'audio',
+        status: 'ok',
+        method: 'ffmpeg-pcm-wav',
+        latencyMs: Date.now() - startedAt,
+        reason: 'Audio entrante de la cámara activo (PCM 16kHz).',
+      });
       res.writeHead(200, {
         'Content-Type': 'audio/wav',
         'Cache-Control': 'no-cache, no-store, must-revalidate',
@@ -884,11 +1174,25 @@ app.get('/api/audio', (req, res) => {
   ff.on('close', (code) => {
     clearTimeout(startWatchdog);
     if (!headersSent) {
-      res.status(502).json({
-        error: stderrLog.includes('401')
-          ? 'La cámara requiere credenciales para audio'
-          : `Sin pista de audio disponible en el stream (código ${code ?? 'ffmpeg'})`,
+      const is401 = stderrLog.includes('401') || stderrLog.toLowerCase().includes('unauthorized');
+      const noAudioTrack = stderrLog.includes('does not contain any stream') || stderrLog.includes('Output file #0 does not contain any stream');
+      const reason = is401
+        ? 'La cámara rechazó las credenciales para audio (HTTP/RTSP 401).'
+        : noAudioTrack
+          ? 'El stream RTSP actual no incluye pista de audio (revisa si el sub-stream o codec G.711/AAC está habilitado en la cámara).'
+          : `Sin pista de audio disponible en el stream (código ffmpeg ${code ?? 'cancelado'}).`;
+      diagnosticsManager.recordSample({
+        ip: targetIp || safeTarget,
+        feature: 'audio',
+        status: 'error',
+        code: is401 ? 401 : (code ?? 'ffmpeg'),
+        latencyMs: Date.now() - startedAt,
+        reason,
+        suggestion: is401
+          ? 'Guarda usuario y contraseña en Editar / Red.'
+          : 'Activa el audio/micrófono en la configuración del canal principal de la cámara o prueba /stream1 o /live/ch00_0.',
       });
+      res.status(502).json({ error: reason });
       return;
     }
     if (!res.writableEnded) res.end();
@@ -897,6 +1201,13 @@ app.get('/api/audio', (req, res) => {
   ff.on('error', () => {
     clearTimeout(startWatchdog);
     if (!headersSent) {
+      diagnosticsManager.recordSample({
+        ip: targetIp || safeTarget,
+        feature: 'audio',
+        status: 'error',
+        reason: 'El binario ffmpeg no está disponible en el sistema para decodificar audio.',
+        suggestion: 'Instala ffmpeg en Termux (pkg install ffmpeg) o ejecuta install-termux.sh.',
+      });
       res.status(502).json({ error: 'ffmpeg no está disponible para extraer audio' });
     } else if (!res.writableEnded) {
       res.end();
@@ -909,12 +1220,24 @@ app.get('/api/audio', (req, res) => {
   });
 });
 
-// Real two-way audio talkback bridge
+// Real two-way audio talkback bridge (RTSP ONVIF Backchannel G.711 + ISAPI/Dahua/Hi3510 HTTP)
 app.post('/api/talk', async (req, res) => {
-  const { url, ip, port = 80, username, password, audioBase64, mimeType = 'audio/wav' } = req.body as {
+  const {
+    url,
+    ip,
+    port = 80,
+    onvifPort,
+    openPorts,
+    username,
+    password,
+    audioBase64,
+    mimeType = 'audio/wav',
+  } = req.body as {
     url?: string;
     ip?: string;
     port?: number;
+    onvifPort?: number;
+    openPorts?: number[];
     username?: string;
     password?: string;
     audioBase64?: string;
@@ -927,71 +1250,103 @@ app.post('/api/talk', async (req, res) => {
   }
 
   const audioBuffer = Buffer.from(audioBase64, 'base64');
-
-  if (ip) {
-    const httpPort = port === 554 ? 80 : port;
+  const targetIp = ip || (() => {
     try {
-      const isapiRes = await fetchWithAuth(`http://${ip}:${httpPort}/ISAPI/System/TwoWayAudio/channels/1/audioData`, {
-        method: 'PUT',
-        headers: { 'Content-Type': mimeType },
-        body: audioBuffer,
-        username,
-        password,
-        timeoutMs: 1500,
-      });
-      if (isapiRes.ok) {
-        res.json({ ok: true, method: 'isapi-twoway' });
-        return;
-      }
+      return url ? new URL(url).hostname : 'camara';
     } catch {
-      // Fall through to RTSP backchannel
+      return 'camara';
     }
+  })();
+
+  const startedAt = Date.now();
+  const attempts: string[] = [];
+
+  // 1. Real RTSP ONVIF Backchannel (DESCRIBE Require: www.onvif.org/ver20/backchannel -> SETUP -> PLAY -> G.711 RTP)
+  let rtspError: string | undefined;
+  if (url && url.startsWith('rtsp://')) {
+    const rtspRes = await rtspBackchannelPool.sendAudio(url, audioBuffer);
+    if (rtspRes.ok) {
+      diagnosticsManager.recordSample({
+        ip: targetIp,
+        feature: 'talk',
+        status: 'ok',
+        method: `rtsp-backchannel:${rtspRes.codec}`,
+        latencyMs: Date.now() - startedAt,
+        reason: `Voz enviada por ONVIF RTSP Backchannel (${rtspRes.codec}, ${rtspRes.bytesSent} bytes).`,
+      });
+      res.json({ ok: true, method: `rtsp-backchannel:${rtspRes.codec}`, bytesSent: rtspRes.bytesSent });
+      return;
+    }
+    rtspError = rtspRes.error;
+    if (rtspError) attempts.push(`RTSP Backchannel: ${rtspError}`);
   }
 
-  if (url && url.startsWith('rtsp://')) {
-    const opId = processManager.startOperation('talk', ip || 'RTSP backchannel', {
-      detail: 'Audio bidireccional G.711',
+  // 2. Fallback: HTTP Two-Way Audio (Hikvision ISAPI open->audioData, Dahua audio.cgi, Hi3510 talk.cgi)
+  if (targetIp) {
+    const httpRes = await sendHttpTwoWayAudio({
+      ip: targetIp,
+      port,
+      onvifPort,
+      openPorts,
+      username,
+      password,
+      audioBuffer,
+      mimeType,
     });
-    const ok = await new Promise<boolean>((resolve) => {
-      const ff = spawn('ffmpeg', [
-        '-y',
-        '-i', 'pipe:0',
-        '-acodec', 'pcm_mulaw',
-        '-ar', '8000',
-        '-ac', '1',
-        '-f', 'rtsp',
-        '-rtsp_transport', 'tcp',
-        url,
-      ]);
-      processManager.attachChildProcess(opId, ff, 2200);
-      ff.on('close', (code) => {
-        resolve(code === 0);
+    attempts.push(...httpRes.attempts);
+    if (httpRes.ok) {
+      diagnosticsManager.recordSample({
+        ip: targetIp,
+        feature: 'talk',
+        status: 'ok',
+        method: httpRes.method,
+        latencyMs: Date.now() - startedAt,
+        reason: `Voz bidireccional activa vía ${httpRes.method}.`,
       });
-      ff.on('error', () => {
-        resolve(false);
-      });
-      ff.stdin.write(audioBuffer);
-      ff.stdin.end();
-    });
-    if (ok) {
-      res.json({ ok: true, method: 'rtsp-backchannel' });
+      res.json({ ok: true, method: httpRes.method });
       return;
     }
   }
 
+  const isAuthErr = attempts.some((a) => a.includes('401'));
+  const finalError = isAuthErr
+    ? `Credenciales rechazadas (401) para audio bidireccional en ${targetIp}.`
+    : rtspError ||
+      'La cámara no anunció pista RTSP backchannel (a=sendonly) ni endpoint HTTP de audio entrante.';
+
+  diagnosticsManager.recordSample({
+    ip: targetIp,
+    feature: 'talk',
+    status: 'error',
+    code: isAuthErr ? 401 : 'backchannel-unsupported',
+    latencyMs: Date.now() - startedAt,
+    reason: finalError,
+    suggestion: isAuthErr
+      ? 'Actualiza usuario y contraseña de la cámara en Editar / Red.'
+      : 'Algunas cámaras exigen usar el stream principal (/live/ch00_0 o /stream1) y activar Audio Bidireccional / G.711 en su menú web.',
+  });
+
   res.status(502).json({
     ok: false,
-    error: 'La cámara no aceptó audio bidireccional (verifica soporte de altavoz/ONVIF backchannel o credenciales).',
+    error: finalError,
+    attempts,
   });
+});
+
+app.post('/api/talk/stop', (req, res) => {
+  const { url } = req.body as { url?: string };
+  rtspBackchannelPool.stop(url);
+  res.json({ ok: true });
 });
 
 // Real ONVIF PTZ control (RelativeMove + timed ContinuousMove + CGI fallback)
 app.post('/api/ptz', async (req, res) => {
-  const { ip, port = 80, onvifPort, profileToken, username, password, direction, speed = 0.25, stepMs = 260 } =
+  const { ip, port = 80, onvifPort, openPorts, profileToken, username, password, direction, speed = 0.25, stepMs = 260 } =
     req.body as {
       ip?: string;
       port?: number;
       onvifPort?: number;
+      openPorts?: number[];
       profileToken?: string;
       username?: string;
       password?: string;
@@ -1005,10 +1360,12 @@ app.post('/api/ptz', async (req, res) => {
     return;
   }
 
+  const startedAt = Date.now();
   const result = await moveOnvifOrCgiPtz({
     ip,
     port,
     onvifPort,
+    openPorts,
     profileToken,
     username,
     password,
@@ -1020,16 +1377,26 @@ app.post('/api/ptz', async (req, res) => {
   if (result.ok) {
     res.json(result);
   } else {
+    diagnosticsManager.recordSample({
+      ip,
+      feature: 'ptz',
+      status: 'error',
+      code: result.authError ? 401 : 'ptz-failed',
+      latencyMs: Date.now() - startedAt,
+      reason: result.error || 'Sin respuesta PTZ',
+      suggestion: result.authError ? 'Verifica credenciales en Editar / Red.' : 'Verifica el puerto ONVIF (80, 8000, 8899).',
+    });
     res.status(502).json(result);
   }
 });
 
-// Broad spotlight / LED / IR light control for ONVIF & HTTP/ESP32 cameras
+// Broad spotlight / LED / floodlight control for ONVIF Relay/Aux & HTTP/CGI cameras
 app.post('/api/light', async (req, res) => {
-  const { ip, port = 80, onvifPort, username, password, on } = req.body as {
+  const { ip, port = 80, onvifPort, openPorts, username, password, on } = req.body as {
     ip?: string;
     port?: number;
     onvifPort?: number;
+    openPorts?: number[];
     username?: string;
     password?: string;
     on?: boolean;
@@ -1039,13 +1406,32 @@ app.post('/api/light', async (req, res) => {
     return;
   }
 
+  const startedAt = Date.now();
   const result = await toggleCameraLight({
     ip,
     port,
     onvifPort,
+    openPorts,
     username,
     password,
     on: Boolean(on),
+  });
+
+  diagnosticsManager.recordSample({
+    ip,
+    feature: 'light',
+    status: result.ok ? 'ok' : 'error',
+    method: result.method,
+    code: result.authError ? 401 : result.ok ? 200 : 'light-unsupported',
+    latencyMs: Date.now() - startedAt,
+    reason: result.ok
+      ? `Luz ${on ? 'encendida' : 'apagada'} vía ${result.method}.`
+      : result.error || 'La cámara no respondió al comando de luz.',
+    suggestion: !result.ok
+      ? result.authError
+        ? 'Ingresa usuario y contraseña válidos en Editar / Red.'
+        : `Intentos realizados: ${result.attempts.slice(0, 6).join(' · ') || 'sin respuesta HTTP/ONVIF'}`
+      : undefined,
   });
 
   if (result.ok) {
@@ -1055,10 +1441,280 @@ app.post('/api/light', async (req, res) => {
   }
 });
 
+// Real hardware Infrared / Night Vision control (ONVIF Imaging IrCutFilter + ISAPI/Dahua/Hi3510 CGI)
+app.post('/api/ir', async (req, res) => {
+  const { ip, port = 80, onvifPort, openPorts, username, password, mode } = req.body as {
+    ip?: string;
+    port?: number;
+    onvifPort?: number;
+    openPorts?: number[];
+    username?: string;
+    password?: string;
+    mode?: 'normal' | 'night' | 'auto';
+  };
+
+  if (!ip || !mode) {
+    res.status(400).json({ ok: false, error: 'Falta ip o mode' });
+    return;
+  }
+
+  const startedAt = Date.now();
+  const result = await setCameraIrMode({
+    ip,
+    port,
+    onvifPort,
+    openPorts,
+    username,
+    password,
+    mode,
+  });
+
+  diagnosticsManager.recordSample({
+    ip,
+    feature: 'ir',
+    status: result.ok ? 'ok' : 'warn',
+    method: result.method,
+    code: result.authError ? 401 : result.ok ? 200 : 'ir-software-only',
+    latencyMs: Date.now() - startedAt,
+    reason: result.ok
+      ? `Modo IR/Visión "${mode}" aplicado en hardware vía ${result.method}.`
+      : result.error || 'Sin respuesta de hardware IR; aplicado filtro visual.',
+    suggestion: !result.ok
+      ? `Intentos: ${result.attempts.slice(0, 5).join(' · ') || 'sin respuesta ONVIF/CGI'}`
+      : undefined,
+  });
+
+  res.status(result.ok ? 200 : 502).json(result);
+});
+
+// Real-Time Error Sampling & Live Hardware Capabilities Diagnostic Endpoints
+app.get('/api/diagnostics', (req, res) => {
+  const ip = typeof req.query.ip === 'string' ? req.query.ip.trim() : undefined;
+  res.json({ samples: diagnosticsManager.listSamples(ip || undefined) });
+});
+
+app.delete('/api/diagnostics', (_req, res) => {
+  diagnosticsManager.clearSamples();
+  res.json({ ok: true });
+});
+
+app.post('/api/diagnose-camera', async (req, res) => {
+  const {
+    ip,
+    port = 554,
+    onvifPort,
+    openPorts,
+    protocol = 'RTSP',
+    streamPath = '/live/ch00_0',
+    username,
+    password,
+  } = req.body as {
+    ip?: string;
+    port?: number;
+    onvifPort?: number;
+    openPorts?: number[];
+    protocol?: CameraChannel['protocol'];
+    streamPath?: string;
+    username?: string;
+    password?: string;
+  };
+
+  if (!ip) {
+    res.status(400).json({ ok: false, error: 'Falta IP de cámara' });
+    return;
+  }
+
+  const checks: CapabilityCheckItem[] = [];
+  const authPrefix =
+    username && username.trim()
+      ? `${encodeURIComponent(username.trim())}:${encodeURIComponent(password || '')}@`
+      : '';
+  const scheme = protocol === 'RTSP' || protocol === 'ONVIF' ? 'rtsp' : 'http';
+  const cleanPath = streamPath.startsWith('/') ? streamPath : `/${streamPath}`;
+  const fullUrl = `${scheme}://${authPrefix}${ip}:${port}${cleanPath}`;
+
+  // 1. TCP Reachability + Open Ports
+  const candidateHttp = buildCandidateHttpPorts(port, onvifPort, openPorts);
+  const [tcpMain, ...httpProbes] = await Promise.all([
+    probePortWithLatency(ip, port, 1200),
+    ...candidateHttp.slice(0, 6).map(async (hp) => ({ port: hp, ...(await probePortWithLatency(ip, hp, 700)) })),
+  ]);
+  const detectedPorts = Array.from(
+    new Set([
+      ...(openPorts || []),
+      ...(tcpMain.open ? [port] : []),
+      ...httpProbes.filter((p) => p.open).map((p) => p.port),
+    ])
+  );
+
+  // 2. ONVIF Profile & Capabilities
+  const onvifStart = Date.now();
+  const onvifProfile = await resolveOnvifProfile(
+    ip,
+    onvifPort || (port !== 554 ? port : undefined),
+    username,
+    password,
+    true,
+    detectedPorts
+  );
+  const onvifLat = Date.now() - onvifStart;
+
+  checks.push({
+    feature: 'verify',
+    label: 'Red, Puertos y ONVIF',
+    supported: tcpMain.open || Boolean(onvifProfile),
+    status: tcpMain.open ? (onvifProfile ? 'ok' : 'warn') : 'error',
+    method: onvifProfile ? `ONVIF :${onvifProfile.onvifPort}` : `TCP :${port}`,
+    latencyMs: tcpMain.latencyMs ?? onvifLat,
+    reason: tcpMain.open
+      ? onvifProfile
+        ? `Puerto ${port} activo. ONVIF detectado (${onvifProfile.manufacturer || 'Genérico'} ${onvifProfile.model || ''}). Puertos abiertos: ${detectedPorts.join(', ')}.`
+        : `Puerto ${port} accesible, pero ONVIF no respondió en ${candidateHttp.slice(0, 4).join(', ')}.`
+      : `No se pudo abrir conexión TCP hacia ${ip}:${port}.`,
+    suggestion: !tcpMain.open
+      ? 'Comprueba que la cámara esté encendida, en la red o configurada con Host Remoto.'
+      : !onvifProfile
+        ? 'Si la cámara usa puerto ONVIF especial (ej. 8899, 8000, 2020), ingrésalo en Editar / Red.'
+        : undefined,
+  });
+
+  // 3. Video + Audio Incoming Probe (ffprobe)
+  const mediaStart = Date.now();
+  const media = await probeMediaStream(fullUrl);
+  const mediaLat = Date.now() - mediaStart;
+
+  checks.push({
+    feature: 'video',
+    label: 'Video en Vivo',
+    supported: media.ok,
+    status: media.ok ? 'ok' : 'error',
+    method: scheme.toUpperCase(),
+    latencyMs: mediaLat,
+    reason: media.ok
+      ? `Stream válido (${media.resolution}, ${media.fps} FPS).`
+      : media.authError
+        ? 'Credenciales rechazadas (401 Unauthorized) al abrir video.'
+        : `ffprobe no detectó stream válido en ${cleanPath}.`,
+    suggestion: media.authError
+      ? 'Actualiza usuario/contraseña en Editar / Red.'
+      : !media.ok
+        ? 'Prueba rutas como /live/ch00_0, /stream1 o /Streaming/Channels/101.'
+        : undefined,
+  });
+
+  checks.push({
+    feature: 'audio',
+    label: 'Audio Entrante (Escuchar)',
+    supported: Boolean(media.hasAudio),
+    status: media.hasAudio ? 'ok' : media.ok ? 'warn' : 'error',
+    method: media.audioCodec ? `Codec ${media.audioCodec}` : 'RTSP Audio',
+    latencyMs: mediaLat,
+    reason: media.hasAudio
+      ? `Pista de audio detectada (${media.audioCodec || 'PCM/AAC'}).`
+      : media.ok
+        ? 'El video funciona, pero la cámara no envió pista de audio en esta ruta RTSP.'
+        : 'Sin stream accesible para inspeccionar audio.',
+    suggestion: !media.hasAudio
+      ? 'Activa Audio/Micrófono en el menú de la cámara o verifica que el stream principal tenga audio habilitado.'
+      : undefined,
+  });
+
+  // 4. Two-Way Audio Backchannel Probe
+  let talkCheck: CapabilityCheckItem;
+  if (scheme === 'rtsp') {
+    const bcStart = Date.now();
+    const bc = await probeRtspBackchannel(fullUrl);
+    talkCheck = {
+      feature: 'talk',
+      label: 'Audio Bidireccional (Hablar)',
+      supported: bc.supported,
+      status: bc.supported ? 'ok' : 'warn',
+      method: bc.supported ? `RTSP Backchannel (${bc.codec})` : 'RTSP/HTTP',
+      latencyMs: Date.now() - bcStart,
+      reason: bc.reason,
+      suggestion: !bc.supported
+        ? 'Si la cámara sí tiene altavoz pero falló aquí, revisa usuario/contraseña o activa el canal principal RTSP / ISAPI HTTP.'
+        : undefined,
+    };
+  } else {
+    talkCheck = {
+      feature: 'talk',
+      label: 'Audio Bidireccional (Hablar)',
+      supported: false,
+      status: 'warn',
+      method: 'HTTP',
+      reason: 'Stream MJPEG HTTP no soporta RTSP backchannel; intentará CGI HTTP si es Hikvision/Dahua.',
+    };
+  }
+  checks.push(talkCheck);
+
+  // 5. PTZ, IR & Light capability summary
+  checks.push({
+    feature: 'ptz',
+    label: 'Movimiento PTZ',
+    supported: Boolean(onvifProfile?.ptzSupported || detectedPorts.some((p) => p === 80 || p === 8000 || p === 8899)),
+    status: onvifProfile?.ptzSupported ? 'ok' : 'warn',
+    method: onvifProfile?.ptzSupported ? `ONVIF PTZ (${onvifProfile.profileToken})` : 'CGI / Sin confirmar',
+    reason: onvifProfile?.ptzSupported
+      ? `Servicio ONVIF PTZ disponible (token ${onvifProfile.profileToken}).`
+      : 'ONVIF no reportó nodo PTZ directo; se intentará RelativeMove o HTTP CGI.',
+  });
+
+  checks.push({
+    feature: 'ir',
+    label: 'Visión Nocturna / Infrarrojo',
+    supported: Boolean(onvifProfile?.imagingSupported || detectedPorts.length > 0),
+    status: onvifProfile?.imagingSupported ? 'ok' : 'warn',
+    method: onvifProfile?.imagingSupported ? 'ONVIF Imaging IrCutFilter' : 'HTTP CGI / Filtro visual',
+    reason: onvifProfile?.imagingSupported
+      ? `ONVIF Imaging disponible (fuente ${onvifProfile.videoSourceToken || 'VideoSource_1'}).`
+      : 'La cámara no anunció ONVIF Imaging; se probará CGI (ISAPI/Dahua/Hi3510) al cambiar modo IR.',
+  });
+
+  checks.push({
+    feature: 'light',
+    label: 'Luz / Linterna Integrada',
+    supported: Boolean((onvifProfile?.relayTokens && onvifProfile.relayTokens.length > 0) || detectedPorts.length > 0),
+    status: onvifProfile?.relayTokens && onvifProfile.relayTokens.length > 0 ? 'ok' : 'warn',
+    method:
+      onvifProfile?.relayTokens && onvifProfile.relayTokens.length > 0
+        ? `ONVIF Relay (${onvifProfile.relayTokens.join(', ')})`
+        : `HTTP Puertos (${detectedPorts.filter((p) => p !== 554).join(', ') || 'ninguno'})`,
+    reason:
+      onvifProfile?.relayTokens && onvifProfile.relayTokens.length > 0
+        ? `Relé de luz ONVIF detectado (${onvifProfile.relayTokens.join(', ')}).`
+        : 'Al pulsar Luz se probarán ONVIF Aux/WhiteLight e interfaces Hikvision/Dahua/Hi3510/Foscam.',
+  });
+
+  for (const c of checks) {
+    diagnosticsManager.recordSample({
+      ip,
+      feature: c.feature,
+      status: c.status,
+      method: c.method,
+      latencyMs: c.latencyMs,
+      reason: c.reason,
+      suggestion: c.suggestion,
+    });
+  }
+
+  res.json({
+    ok: true,
+    openPorts: detectedPorts,
+    checks,
+    samples: diagnosticsManager.listSamples(ip),
+  });
+});
+
 async function startServer() {
+  const httpServer = http.createServer(app);
+
   if (process.env.NODE_ENV !== 'production') {
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      server: {
+        middlewareMode: true,
+        hmr: process.env.DISABLE_HMR === 'true' ? false : { server: httpServer },
+      },
       appType: 'spa',
     });
     app.use(vite.middlewares);
@@ -1066,7 +1722,7 @@ async function startServer() {
     app.use(express.static(path.resolve('dist')));
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
+  httpServer.listen(PORT, '0.0.0.0', () => {
     console.log(`VigíaLAN corriendo en http://0.0.0.0:${PORT}`);
   });
 }

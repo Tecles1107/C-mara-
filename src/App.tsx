@@ -1,5 +1,14 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Activity, Camera, Grid2x2, Maximize2, RefreshCw, Square, Terminal } from 'lucide-react';
+import {
+  Activity,
+  BookmarkCheck,
+  Camera,
+  Grid2x2,
+  Maximize2,
+  RefreshCw,
+  Square,
+  Terminal,
+} from 'lucide-react';
 import {
   CameraChannel,
   CameraProtocol,
@@ -12,13 +21,21 @@ import {
   buildStreamUrl,
   clampZoomPan,
   filterCameras,
+  mergeCameraLists,
+  resolveEffectiveEndpoint,
   shouldTriggerMotionAlert,
 } from './utils/cameraLogic';
-import { ProcessOperationRecord, ScanProfile } from './utils/processLogic';
+import {
+  CapabilityCheckItem,
+  DiagnosticSample,
+  ProcessOperationRecord,
+  ScanProfile,
+} from './utils/processLogic';
 import { VisionMode } from './components/CameraFeedCanvas';
 import { CameraSidebar, ScanProgressState } from './components/CameraSidebar';
-import { SingleCameraView } from './components/SingleCameraView';
+import { BottomTabType, SingleCameraView } from './components/SingleCameraView';
 import { MosaicView } from './components/MosaicView';
+import { SavedDevicesView } from './components/SavedDevicesView';
 import { ProcessMonitorPanel } from './components/ProcessMonitorPanel';
 import { TermuxSetupView } from './components/TermuxSetupView';
 import { MotionSettingsModal } from './components/MotionSettingsModal';
@@ -26,8 +43,32 @@ import { CameraCredentialsModal } from './components/CameraCredentialsModal';
 import { AppErrorItem, ErrorBanner } from './components/ErrorBanner';
 import { VoiceSessionHandle, startVoiceTalkSession } from './utils/voiceProcessor';
 
+const SAVED_STORAGE_KEY = 'vigialan_saved_cameras';
+
+function readLocalSavedCameras(): CameraChannel[] {
+  try {
+    const raw = localStorage.getItem(SAVED_STORAGE_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed.map((c) => ({ ...c, isSaved: true })) : [];
+  } catch {
+    return [];
+  }
+}
+
+function writeLocalSavedCameras(list: CameraChannel[]): void {
+  try {
+    const onlySaved = list.filter((c) => c.isSaved);
+    localStorage.setItem(SAVED_STORAGE_KEY, JSON.stringify(onlySaved));
+  } catch {
+    // Ignore storage quota errors
+  }
+}
+
 export default function App() {
-  const [cameras, setCameras] = useState<CameraChannel[]>(INITIAL_CAMERAS);
+  const [cameras, setCameras] = useState<CameraChannel[]>(() =>
+    mergeCameraLists(readLocalSavedCameras(), INITIAL_CAMERAS)
+  );
   const [selectedId, setSelectedId] = useState<string>('');
   const [viewMode, setViewMode] = useState<ViewMode>('single');
   const [scanMessage, setScanMessage] = useState<string>('');
@@ -56,10 +97,13 @@ export default function App() {
   const [scanProgress, setScanProgress] = useState<ScanProgressState | null>(null);
   const [showAddForm, setShowAddForm] = useState(false);
 
-  // Processes & Connections Monitor
+  // Processes, Connections & Diagnostics Monitor
   const [operations, setOperations] = useState<ProcessOperationRecord[]>([]);
   const [activeProcessCount, setActiveProcessCount] = useState(0);
   const [showEmptyProcesses, setShowEmptyProcesses] = useState(false);
+  const [diagnosticChecks, setDiagnosticChecks] = useState<CapabilityCheckItem[]>([]);
+  const [diagnosticSamples, setDiagnosticSamples] = useState<DiagnosticSample[]>([]);
+  const [isRunningDiagnostic, setIsRunningDiagnostic] = useState(false);
 
   // Single camera controls
   const [zoom, setZoom] = useState(1);
@@ -67,7 +111,9 @@ export default function App() {
   const [panY, setPanY] = useState(0);
   const [audioEnabled, setAudioEnabled] = useState(false);
   const [visionMode, setVisionMode] = useState<VisionMode>('normal');
+  const [irStatusLabel, setIrStatusLabel] = useState<string>('');
   const [lightOn, setLightOn] = useState(false);
+  const [lightBusy, setLightBusy] = useState(false);
   const [talkActive, setTalkActive] = useState(false);
   const [deepVoice, setDeepVoice] = useState(false);
   const [ptzSpeed, setPtzSpeed] = useState<number>(0.22);
@@ -80,12 +126,14 @@ export default function App() {
   const [credsCamera, setCredsCamera] = useState<CameraChannel | null>(null);
   const [motionEvents, setMotionEvents] = useState<MotionEvent[]>([]);
   const [clips, setClips] = useState<RecordedClip[]>([]);
-  const [bottomTab, setBottomTab] = useState<'events' | 'clips' | 'processes'>('events');
+  const [bottomTab, setBottomTab] = useState<BottomTabType>('events');
 
   const lastAlertMapRef = useRef<Record<string, number>>({});
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const voiceSessionRef = useRef<VoiceSessionHandle | null>(null);
   const scanSourceRef = useRef<EventSource | null>(null);
+
+  const savedCameras = useMemo(() => cameras.filter((c) => c.isSaved), [cameras]);
 
   const filteredCameras = useMemo(
     () =>
@@ -121,6 +169,54 @@ export default function App() {
     ]);
   }, []);
 
+  const persistSavedCamera = useCallback(async (cam: CameraChannel) => {
+    const toSave: CameraChannel = {
+      ...cam,
+      isSaved: true,
+      lastSeenAt: cam.lastSeenAt || Date.now(),
+    };
+    setCameras((prev) => {
+      const exists = prev.some((c) => c.id === toSave.id);
+      const next = exists
+        ? prev.map((c) => (c.id === toSave.id ? toSave : c))
+        : [toSave, ...prev];
+      writeLocalSavedCameras(next);
+      return next;
+    });
+    try {
+      await fetch(`/api/saved-cameras/${encodeURIComponent(toSave.id)}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(toSave),
+      });
+    } catch {
+      // LocalStorage still preserves saved device if offline
+    }
+  }, []);
+
+  // Load saved devices from server & sync with localStorage on startup
+  useEffect(() => {
+    let active = true;
+    fetch('/api/saved-cameras')
+      .then((r) => (r.ok ? r.json() : null))
+      .then((data) => {
+        if (!active || !data?.cameras) return;
+        const serverSaved: CameraChannel[] = data.cameras;
+        setCameras((prev) => {
+          const merged = mergeCameraLists(serverSaved, prev);
+          writeLocalSavedCameras(merged);
+          return merged;
+        });
+        if (serverSaved.length > 0) {
+          setSelectedId((prevId) => prevId || serverSaved[0].id);
+        }
+      })
+      .catch(() => {});
+    return () => {
+      active = false;
+    };
+  }, []);
+
   const fetchProcesses = useCallback(async () => {
     try {
       const res = await fetch('/api/processes');
@@ -133,17 +229,44 @@ export default function App() {
     }
   }, []);
 
-  useEffect(() => {
-    fetchProcesses();
-  }, [fetchProcesses]);
+  const fetchDiagnostics = useCallback(async (ip?: string) => {
+    try {
+      const q = ip ? `?ip=${encodeURIComponent(ip)}` : '';
+      const res = await fetch(`/api/diagnostics${q}`);
+      if (!res.ok) return;
+      const data = await res.json();
+      setDiagnosticSamples(data.samples || []);
+    } catch {
+      // Non-fatal background refresh
+    }
+  }, []);
 
   useEffect(() => {
-    const shouldPoll = isScanning || bottomTab === 'processes' || showEmptyProcesses;
-    if (!shouldPoll) return;
     fetchProcesses();
-    const timer = window.setInterval(fetchProcesses, 1500);
+    fetchDiagnostics(selectedCamera?.ip);
+  }, [fetchProcesses, fetchDiagnostics, selectedCamera?.ip]);
+
+  useEffect(() => {
+    const shouldPollProcesses = isScanning || bottomTab === 'processes' || showEmptyProcesses;
+    const shouldPollDiag = bottomTab === 'diagnostics' || talkActive || audioEnabled;
+    if (!shouldPollProcesses && !shouldPollDiag) return;
+    if (shouldPollProcesses) fetchProcesses();
+    if (shouldPollDiag) fetchDiagnostics(selectedCamera?.ip);
+    const timer = window.setInterval(() => {
+      if (shouldPollProcesses) fetchProcesses();
+      if (shouldPollDiag) fetchDiagnostics(selectedCamera?.ip);
+    }, 1500);
     return () => window.clearInterval(timer);
-  }, [isScanning, bottomTab, showEmptyProcesses, fetchProcesses]);
+  }, [
+    isScanning,
+    bottomTab,
+    showEmptyProcesses,
+    talkActive,
+    audioEnabled,
+    selectedCamera?.ip,
+    fetchProcesses,
+    fetchDiagnostics,
+  ]);
 
   useEffect(() => {
     const onErr = (event: ErrorEvent) => {
@@ -176,7 +299,9 @@ export default function App() {
   // Reset per-camera states when switching camera
   useEffect(() => {
     if (selectedCamera) {
-      setVisionMode(selectedCamera.nightVision ? 'night' : 'normal');
+      setVisionMode(selectedCamera.irMode || (selectedCamera.nightVision ? 'night' : 'normal'));
+      setIrStatusLabel('');
+      setDiagnosticChecks([]);
       setZoom(1);
       setPanX(0);
       setPanY(0);
@@ -299,6 +424,10 @@ export default function App() {
           ip: cam.ip,
           port: cam.port,
           onvifPort: cam.onvifPort,
+          remoteHost: cam.remoteHost,
+          remotePort: cam.remotePort,
+          remoteOnvifPort: cam.remoteOnvifPort,
+          connectionMode: cam.connectionMode || 'auto',
           protocol: cam.protocol,
           streamPath: cam.streamPath,
           username: cam.username,
@@ -314,11 +443,15 @@ export default function App() {
         fps: data.fps || cam.fps,
         hasAudio: Boolean(data.hasAudio),
         onvifPort: data.onvifPort || cam.onvifPort,
+        openPorts: Array.isArray(data.openPorts) && data.openPorts.length > 0 ? data.openPorts : cam.openPorts,
         profileToken: data.profileToken || cam.profileToken,
         manufacturer: data.manufacturer || cam.manufacturer,
         model: data.model || cam.model,
         authStatus: data.authStatus || 'unknown',
         latencyMs: data.latencyMs ?? cam.latencyMs,
+        activeEndpoint: data.activeEndpoint || 'local',
+        isSaved: true,
+        lastSeenAt: Date.now(),
         capabilities: {
           ptz: Boolean(data.ptzSupported || cam.protocol === 'ONVIF'),
           audio: Boolean(data.hasAudio),
@@ -326,16 +459,50 @@ export default function App() {
           twoWayAudio: Boolean(data.onvifPort || cam.protocol === 'ONVIF'),
         },
       };
-      setCameras((prev) => prev.map((c) => (c.id === updated.id ? updated : c)));
+      await persistSavedCamera(updated);
       fetchProcesses();
+      fetchDiagnostics(updated.ip);
 
       if (data.authStatus === 'required' || data.authStatus === 'failed') {
-        reportError(`La cámara ${cam.ip} requiere usuario y contraseña válidos para mostrar video/audio.`);
+        reportError(`La cámara ${cam.name} (${cam.ip}) requiere usuario y contraseña válidos para mostrar video/audio.`);
       } else if (!data.ok && !data.reachable) {
-        reportError(`No se pudo alcanzar ${cam.ip}:${cam.port}. Verifica la IP o subred.`);
+        reportError(
+          cam.remoteHost
+            ? `No se pudo alcanzar ${cam.ip}:${cam.port} ni el host remoto ${cam.remoteHost}.`
+            : `No se pudo alcanzar ${cam.ip}:${cam.port}. Verifica la IP, subred o configura un Host Remoto en Editar.`
+        );
       }
     } catch {
       reportError(`Error verificando conexión con ${cam.ip}`);
+    }
+  };
+
+  const handleSaveCameraOnly = async (updated: CameraChannel) => {
+    await persistSavedCamera(updated);
+  };
+
+  const handleDeleteSavedCamera = async (id: string) => {
+    setCameras((prev) => {
+      const next = prev.filter((c) => c.id !== id);
+      writeLocalSavedCameras(next);
+      return next;
+    });
+    if (selectedId === id) {
+      setSelectedId('');
+    }
+    try {
+      await fetch(`/api/saved-cameras/${encodeURIComponent(id)}`, { method: 'DELETE' });
+    } catch {
+      // Ignore network error on delete
+    }
+  };
+
+  const handleSelectAndAutoSaveCamera = (id: string) => {
+    setSelectedId(id);
+    setViewMode('single');
+    const cam = cameras.find((c) => c.id === id);
+    if (cam) {
+      persistSavedCamera({ ...cam, lastSeenAt: Date.now() });
     }
   };
 
@@ -392,12 +559,7 @@ export default function App() {
     es.addEventListener('camera', (ev) => {
       try {
         const cam = JSON.parse((ev as MessageEvent).data) as CameraChannel;
-        setCameras((prev) => {
-          if (prev.some((c) => c.id === cam.id || (c.ip === cam.ip && c.port === cam.port))) {
-            return prev;
-          }
-          return [...prev, cam];
-        });
+        setCameras((prev) => mergeCameraLists(prev.filter((c) => c.isSaved), [...prev.filter((c) => !c.isSaved), cam]));
         setSelectedId((prevId) => prevId || cam.id);
       } catch {
         // Ignore parse issues
@@ -453,6 +615,7 @@ export default function App() {
     name: string;
     ip: string;
     port: number;
+    remoteHost?: string;
     streamPath: string;
     protocol: CameraProtocol;
     username?: string;
@@ -463,6 +626,8 @@ export default function App() {
       name: input.name,
       ip: input.ip,
       port: input.port,
+      remoteHost: input.remoteHost,
+      connectionMode: 'auto',
       protocol: input.protocol,
       streamPath: input.streamPath,
       status: 'online',
@@ -474,8 +639,10 @@ export default function App() {
       username: input.username,
       password: input.password,
       authStatus: 'unknown',
+      isSaved: true,
+      lastSeenAt: Date.now(),
     };
-    setCameras((prev) => [newCam, ...prev]);
+    await persistSavedCamera(newCam);
     setSelectedId(newCam.id);
     setViewMode('single');
     setShowAddForm(false);
@@ -487,14 +654,16 @@ export default function App() {
     stepMs?: number
   ) => {
     if (!selectedCamera) return;
+    const ep = resolveEffectiveEndpoint(selectedCamera);
     try {
       const res = await fetch('/api/ptz', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          ip: selectedCamera.ip,
-          port: selectedCamera.port,
-          onvifPort: selectedCamera.onvifPort,
+          ip: ep.host,
+          port: ep.port,
+          onvifPort: ep.onvifPort,
+          openPorts: selectedCamera.openPorts,
           profileToken: selectedCamera.profileToken,
           username: selectedCamera.username,
           password: selectedCamera.password,
@@ -506,6 +675,7 @@ export default function App() {
       if (!res.ok && direction !== 'stop') {
         const data = await res.json().catch(() => ({}));
         reportError(data.error || 'La cámara no respondió al movimiento PTZ.');
+        fetchDiagnostics(ep.host);
       }
     } catch {
       if (direction !== 'stop') {
@@ -514,17 +684,64 @@ export default function App() {
     }
   };
 
-  const toggleLight = async () => {
+  const handleVisionModeChange = async (mode: VisionMode) => {
+    setVisionMode(mode);
     if (!selectedCamera) return;
+    const ep = resolveEffectiveEndpoint(selectedCamera);
+    setIrStatusLabel(`Aplicando ${mode === 'night' ? 'IR Nocturna' : mode === 'normal' ? 'Día (Sin IR)' : 'IR Auto'}...`);
+    try {
+      const res = await fetch('/api/ir', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          ip: ep.host,
+          port: ep.port,
+          onvifPort: ep.onvifPort,
+          openPorts: selectedCamera.openPorts,
+          username: selectedCamera.username,
+          password: selectedCamera.password,
+          mode,
+        }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok && data.ok) {
+        setIrStatusLabel(
+          mode === 'night'
+            ? 'IR ON (Hardware)'
+            : mode === 'normal'
+              ? 'Día · Sin IR (Hardware)'
+              : 'IR Auto (Hardware)'
+        );
+      } else {
+        setIrStatusLabel(mode === 'night' ? 'Nocturna (Visual)' : mode === 'normal' ? 'Sin IR (Visual)' : 'Auto (Visual)');
+        reportError(data.error || 'No se confirmó cambio de infrarrojo en hardware; aplicado en pantalla.');
+      }
+      persistSavedCamera({
+        ...selectedCamera,
+        irMode: mode,
+        nightVision: mode === 'night',
+      });
+      fetchDiagnostics(ep.host);
+    } catch {
+      setIrStatusLabel(mode === 'night' ? 'Nocturna (Visual)' : 'Sin IR (Visual)');
+      reportError('Error de conexión enviando comando de infrarrojo.');
+    }
+  };
+
+  const toggleLight = async () => {
+    if (!selectedCamera || lightBusy) return;
+    const ep = resolveEffectiveEndpoint(selectedCamera);
     const next = !lightOn;
+    setLightBusy(true);
     try {
       const res = await fetch('/api/light', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          ip: selectedCamera.ip,
-          port: selectedCamera.port,
-          onvifPort: selectedCamera.onvifPort,
+          ip: ep.host,
+          port: ep.port,
+          onvifPort: ep.onvifPort,
+          openPorts: selectedCamera.openPorts,
           username: selectedCamera.username,
           password: selectedCamera.password,
           on: next,
@@ -536,22 +753,31 @@ export default function App() {
       } else {
         reportError(data.error || 'No se pudo controlar la linterna de esta cámara.');
       }
+      fetchDiagnostics(ep.host);
     } catch {
       reportError('Error de conexión al intentar encender/apagar la luz.');
+    } finally {
+      setLightBusy(false);
     }
   };
 
   const toggleTalk = async () => {
     if (!selectedCamera) return;
+    const ep = resolveEffectiveEndpoint(selectedCamera);
+    const targetUrl = buildStreamUrl(selectedCamera, ep);
     if (talkActive) {
       voiceSessionRef.current?.stop();
       voiceSessionRef.current = null;
       setTalkActive(false);
+      fetch('/api/talk/stop', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url: targetUrl }),
+      }).catch(() => {});
       return;
     }
 
     try {
-      const targetUrl = buildStreamUrl(selectedCamera);
       let chunkErrorReported = false;
       const session = await startVoiceTalkSession({
         initialDeepVoice: deepVoice,
@@ -563,8 +789,10 @@ export default function App() {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
               url: targetUrl,
-              ip: selectedCamera.ip,
-              port: selectedCamera.onvifPort || selectedCamera.port,
+              ip: ep.host,
+              port: ep.port,
+              onvifPort: ep.onvifPort,
+              openPorts: selectedCamera.openPorts,
               username: selectedCamera.username,
               password: selectedCamera.password,
               audioBase64,
@@ -575,6 +803,7 @@ export default function App() {
             chunkErrorReported = true;
             const d = await res.json().catch(() => ({}));
             reportError(d.error || 'La cámara no aceptó audio bidireccional.');
+            fetchDiagnostics(ep.host);
           }
         },
       });
@@ -583,6 +812,50 @@ export default function App() {
     } catch (err) {
       reportError(err instanceof Error ? err.message : 'No se pudo activar el micrófono.');
       setTalkActive(false);
+    }
+  };
+
+  const handleRunDiagnostic = async () => {
+    if (!selectedCamera) return;
+    const ep = resolveEffectiveEndpoint(selectedCamera);
+    setIsRunningDiagnostic(true);
+    try {
+      const res = await fetch('/api/diagnose-camera', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          ip: ep.host,
+          port: ep.port,
+          onvifPort: ep.onvifPort,
+          openPorts: selectedCamera.openPorts,
+          protocol: selectedCamera.protocol,
+          streamPath: selectedCamera.streamPath,
+          username: selectedCamera.username,
+          password: selectedCamera.password,
+        }),
+      });
+      const data = await res.json();
+      if (data.checks) setDiagnosticChecks(data.checks);
+      if (data.samples) setDiagnosticSamples(data.samples);
+      if (Array.isArray(data.openPorts) && data.openPorts.length > 0) {
+        persistSavedCamera({
+          ...selectedCamera,
+          openPorts: data.openPorts,
+        });
+      }
+    } catch {
+      reportError('No se pudo completar el diagnóstico de hardware.');
+    } finally {
+      setIsRunningDiagnostic(false);
+    }
+  };
+
+  const handleClearDiagnostics = async () => {
+    try {
+      await fetch('/api/diagnostics', { method: 'DELETE' });
+      setDiagnosticSamples([]);
+    } catch {
+      // Ignore
     }
   };
 
@@ -610,6 +883,8 @@ export default function App() {
     }
     setDraggedCamId(null);
   };
+
+  const showSidebar = viewMode === 'single' || viewMode === 'mosaic';
 
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col">
@@ -642,6 +917,16 @@ export default function App() {
           >
             <Grid2x2 className="w-3.5 h-3.5" />
             <span>Mosaico</span>
+          </button>
+          <button
+            type="button"
+            onClick={() => setViewMode('saved')}
+            className={`flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-md transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+              viewMode === 'saved' ? 'bg-slate-800 text-slate-100' : 'text-slate-400 hover:text-slate-200'
+            }`}
+          >
+            <BookmarkCheck className="w-3.5 h-3.5" />
+            <span className="tabular-nums">Guardados ({savedCameras.length})</span>
           </button>
           <button
             type="button"
@@ -686,7 +971,7 @@ export default function App() {
 
       {/* Main Workspace */}
       <div className="flex-1 flex flex-col lg:flex-row min-h-0">
-        {viewMode !== 'termux' && (
+        {showSidebar && (
           <CameraSidebar
             cameras={cameras}
             filteredCameras={filteredCameras}
@@ -716,10 +1001,7 @@ export default function App() {
             onOnlyOnlineChange={setOnlyOnline}
             onOnlyAudioChange={setOnlyAudio}
             onOnlyPtzChange={setOnlyPtz}
-            onSelectCamera={(id) => {
-              setSelectedId(id);
-              setViewMode('single');
-            }}
+            onSelectCamera={handleSelectAndAutoSaveCamera}
             onAddManualCamera={handleAddManualCamera}
           />
         )}
@@ -727,16 +1009,26 @@ export default function App() {
         <main className="flex-1 flex flex-col min-w-0 bg-slate-950">
           {viewMode === 'termux' && <TermuxSetupView />}
 
+          {viewMode === 'saved' && (
+            <SavedDevicesView
+              savedCameras={savedCameras}
+              onConnectCamera={(cam) => {
+                handleSelectAndAutoSaveCamera(cam.id);
+                verifyAndUpdateCamera(cam);
+              }}
+              onTestCamera={verifyAndUpdateCamera}
+              onEditCamera={(cam) => setCredsCamera(cam)}
+              onDeleteCamera={handleDeleteSavedCamera}
+            />
+          )}
+
           {viewMode === 'mosaic' && (
             <MosaicView
               cameras={onlineCameras}
               draggedCamId={draggedCamId}
               onDragStart={setDraggedCamId}
               onDropOnCamera={handleDropOnMosaicCamera}
-              onOpenCamera={(id) => {
-                setSelectedId(id);
-                setViewMode('single');
-              }}
+              onOpenCamera={handleSelectAndAutoSaveCamera}
               onOpenMotionSettings={() => setIsMotionModalOpen(true)}
               onMotionScore={handleMotionScore}
             />
@@ -752,7 +1044,7 @@ export default function App() {
                   <h1 className="text-lg font-semibold text-slate-100">Sin cámaras conectadas</h1>
                   <p className="text-sm text-slate-400">
                     {scanMessage ||
-                      'Pulsa "Escanear Red" para descubrir cámaras ONVIF, SSDP, RTSP o MJPEG en tus subredes, o agrega una dirección IP manualmente.'}
+                      'Pulsa "Escanear Red" para descubrir cámaras en tus subredes, agrega una IP manualmente o abre tus Dispositivos Guardados.'}
                   </p>
                 </div>
                 <div className="flex flex-wrap items-center justify-center gap-3">
@@ -806,7 +1098,9 @@ export default function App() {
               panY={panY}
               audioEnabled={audioEnabled}
               visionMode={visionMode}
+              irStatusLabel={irStatusLabel}
               lightOn={lightOn}
+              lightBusy={lightBusy}
               talkActive={talkActive}
               deepVoice={deepVoice}
               ptzSpeed={ptzSpeed}
@@ -817,19 +1111,23 @@ export default function App() {
               clips={clips}
               operations={operations}
               activeProcessCount={activeProcessCount}
+              diagnosticChecks={diagnosticChecks}
+              diagnosticSamples={diagnosticSamples}
+              isRunningDiagnostic={isRunningDiagnostic}
               bottomTab={bottomTab}
               audioRef={audioRef}
               onAudioError={() => {
                 if (audioEnabled) {
                   reportError(
-                    `No se pudo recibir audio desde ${selectedCamera.ip}. Verifica credenciales o soporte de micrófono en la cámara.`
+                    `No se pudo recibir audio desde ${selectedCamera.ip}. Revisa la pestaña Diagnóstico para ver el motivo exacto.`
                   );
                   setAudioEnabled(false);
+                  fetchDiagnostics(selectedCamera.ip);
                 }
               }}
               onOpenCredentials={() => setCredsCamera(selectedCamera)}
               onToggleAudio={() => setAudioEnabled((v) => !v)}
-              onVisionModeChange={setVisionMode}
+              onVisionModeChange={handleVisionModeChange}
               onToggleRecord={() => setIsRecording((v) => !v)}
               onOpenMotionSettings={() => setIsMotionModalOpen(true)}
               onZoomPanChange={updateZoomPan}
@@ -844,6 +1142,9 @@ export default function App() {
               onBottomTabChange={setBottomTab}
               onRefreshProcesses={fetchProcesses}
               onKillProcess={handleKillProcess}
+              onRunDiagnostic={handleRunDiagnostic}
+              onRefreshDiagnostics={() => fetchDiagnostics(selectedCamera.ip)}
+              onClearDiagnostics={handleClearDiagnostics}
             />
           )}
         </main>
@@ -859,7 +1160,9 @@ export default function App() {
       <CameraCredentialsModal
         camera={credsCamera}
         onClose={() => setCredsCamera(null)}
+        onSaveOnly={handleSaveCameraOnly}
         onSaveAndVerify={verifyAndUpdateCamera}
+        onDelete={handleDeleteSavedCamera}
       />
     </div>
   );

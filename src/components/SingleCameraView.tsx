@@ -1,5 +1,6 @@
 import React, { useRef } from 'react';
 import {
+  Activity,
   ArrowDown,
   ArrowLeft,
   ArrowRight,
@@ -13,11 +14,13 @@ import {
   Maximize2,
   Mic,
   MicOff,
+  Moon,
   Radio,
   RotateCcw,
   Settings,
   ShieldCheck,
   Square,
+  Sun,
   Video,
   Volume2,
   ZoomIn,
@@ -32,9 +35,17 @@ import {
   formatBytes,
   formatDuration,
 } from '../utils/cameraLogic';
-import { ProcessOperationRecord, formatLatency } from '../utils/processLogic';
+import {
+  CapabilityCheckItem,
+  DiagnosticSample,
+  ProcessOperationRecord,
+  formatLatency,
+} from '../utils/processLogic';
 import { CameraFeedCanvas, VisionMode } from './CameraFeedCanvas';
+import { DiagnosticsPanel } from './DiagnosticsPanel';
 import { ProcessMonitorPanel } from './ProcessMonitorPanel';
+
+export type BottomTabType = 'events' | 'clips' | 'processes' | 'diagnostics';
 
 interface SingleCameraViewProps {
   camera: CameraChannel;
@@ -43,7 +54,9 @@ interface SingleCameraViewProps {
   panY: number;
   audioEnabled: boolean;
   visionMode: VisionMode;
+  irStatusLabel?: string;
   lightOn: boolean;
+  lightBusy?: boolean;
   talkActive: boolean;
   deepVoice: boolean;
   ptzSpeed: number;
@@ -54,7 +67,10 @@ interface SingleCameraViewProps {
   clips: RecordedClip[];
   operations: ProcessOperationRecord[];
   activeProcessCount: number;
-  bottomTab: 'events' | 'clips' | 'processes';
+  diagnosticChecks: CapabilityCheckItem[];
+  diagnosticSamples: DiagnosticSample[];
+  isRunningDiagnostic: boolean;
+  bottomTab: BottomTabType;
   audioRef: React.RefObject<HTMLAudioElement | null>;
   onAudioError: () => void;
   onOpenCredentials: () => void;
@@ -71,9 +87,12 @@ interface SingleCameraViewProps {
   onSnapshot: () => void;
   onToggleTalk: () => void;
   onToggleDeepVoice: () => void;
-  onBottomTabChange: (tab: 'events' | 'clips' | 'processes') => void;
+  onBottomTabChange: (tab: BottomTabType) => void;
   onRefreshProcesses: () => void;
   onKillProcess: (id: string) => void;
+  onRunDiagnostic: () => void;
+  onRefreshDiagnostics: () => void;
+  onClearDiagnostics: () => void;
 }
 
 export const SingleCameraView: React.FC<SingleCameraViewProps> = ({
@@ -83,7 +102,9 @@ export const SingleCameraView: React.FC<SingleCameraViewProps> = ({
   panY,
   audioEnabled,
   visionMode,
+  irStatusLabel,
   lightOn,
+  lightBusy = false,
   talkActive,
   deepVoice,
   ptzSpeed,
@@ -94,6 +115,9 @@ export const SingleCameraView: React.FC<SingleCameraViewProps> = ({
   clips,
   operations,
   activeProcessCount,
+  diagnosticChecks,
+  diagnosticSamples,
+  isRunningDiagnostic,
   bottomTab,
   audioRef,
   onAudioError,
@@ -114,6 +138,9 @@ export const SingleCameraView: React.FC<SingleCameraViewProps> = ({
   onBottomTabChange,
   onRefreshProcesses,
   onKillProcess,
+  onRunDiagnostic,
+  onRefreshDiagnostics,
+  onClearDiagnostics,
 }) => {
   const videoContainerRef = useRef<HTMLDivElement | null>(null);
 
@@ -126,6 +153,7 @@ export const SingleCameraView: React.FC<SingleCameraViewProps> = ({
   };
 
   const needsAuth = camera.authStatus === 'required' || camera.authStatus === 'failed';
+  const diagErrorCount = diagnosticSamples.filter((s) => s.status === 'error').length;
 
   return (
     <div className="p-4 lg:p-6 space-y-5 max-w-6xl w-full mx-auto">
@@ -133,7 +161,7 @@ export const SingleCameraView: React.FC<SingleCameraViewProps> = ({
         ref={audioRef}
         src={
           audioEnabled && camera.status === 'online'
-            ? `/api/audio?url=${encodeURIComponent(buildStreamUrl(camera))}`
+            ? `/api/audio?url=${encodeURIComponent(buildStreamUrl(camera))}&ip=${encodeURIComponent(camera.ip)}`
             : undefined
         }
         onError={onAudioError}
@@ -151,7 +179,10 @@ export const SingleCameraView: React.FC<SingleCameraViewProps> = ({
             )}
           </div>
           <p className="text-xs text-slate-400 font-mono tabular-nums mt-0.5 truncate">
-            {camera.ip}:{camera.port}{camera.streamPath} · {camera.protocol} · {camera.resolution} · {camera.fps} FPS
+            {camera.activeEndpoint === 'remote' && camera.remoteHost
+              ? `${camera.remoteHost}:${camera.remotePort || camera.port} (Remoto)`
+              : `${camera.ip}:${camera.port}`}
+            {camera.streamPath} · {camera.protocol} · {camera.resolution} · {camera.fps} FPS
             {camera.latencyMs !== undefined ? ` · ${formatLatency(camera.latencyMs)}` : ''}
             {camera.manufacturer ? ` · ${camera.manufacturer}` : ''}
           </p>
@@ -168,7 +199,7 @@ export const SingleCameraView: React.FC<SingleCameraViewProps> = ({
             }`}
           >
             <KeyRound className={`w-3.5 h-3.5 ${needsAuth ? 'text-amber-400' : 'text-sky-400'}`} />
-            <span>{needsAuth ? 'Clave requerida' : 'Credenciales'}</span>
+            <span>{needsAuth ? 'Clave requerida' : 'Editar / Red'}</span>
           </button>
 
           <button
@@ -185,16 +216,51 @@ export const SingleCameraView: React.FC<SingleCameraViewProps> = ({
             <span>{audioEnabled ? 'Audio activo' : 'Escuchar'}</span>
           </button>
 
-          <select
-            aria-label="Modo de visión"
-            value={visionMode}
-            onChange={(e) => onVisionModeChange(e.target.value as VisionMode)}
-            className="px-3 py-2 text-xs font-medium rounded-lg border bg-slate-900 border-slate-800 text-slate-200 cursor-pointer"
+          {/* Infrared / Night Vision Control (Sin IR / IR ON / Auto) */}
+          <div
+            role="group"
+            aria-label="Modo de visión nocturna e infrarrojo"
+            className="flex items-center p-0.5 rounded-lg border border-slate-800 bg-slate-900"
           >
-            <option value="normal">Visión: Normal</option>
-            <option value="night">Visión: Nocturna</option>
-            <option value="auto">Visión: Automático</option>
-          </select>
+            <button
+              type="button"
+              onClick={() => onVisionModeChange('normal')}
+              className={`flex items-center gap-1 px-2.5 py-1.5 text-xs font-medium rounded-md transition-colors cursor-pointer ${
+                visionMode === 'normal'
+                  ? 'bg-slate-800 text-slate-100'
+                  : 'text-slate-400 hover:text-slate-200'
+              }`}
+              title="Desactivar infrarrojo y usar modo normal (día)"
+            >
+              <Sun className="w-3.5 h-3.5 text-amber-300" />
+              <span>Sin IR</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => onVisionModeChange('night')}
+              className={`flex items-center gap-1 px-2.5 py-1.5 text-xs font-medium rounded-md transition-colors cursor-pointer ${
+                visionMode === 'night'
+                  ? 'bg-emerald-600/30 text-emerald-200'
+                  : 'text-slate-400 hover:text-slate-200'
+              }`}
+              title="Activar visión nocturna e infrarrojo en la cámara"
+            >
+              <Moon className="w-3.5 h-3.5 text-emerald-400" />
+              <span>Nocturna / IR</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => onVisionModeChange('auto')}
+              className={`px-2.5 py-1.5 text-xs font-medium rounded-md transition-colors cursor-pointer ${
+                visionMode === 'auto'
+                  ? 'bg-sky-600/25 text-sky-200'
+                  : 'text-slate-400 hover:text-slate-200'
+              }`}
+              title="Infrarrojo automático según luz ambiente"
+            >
+              IR Auto
+            </button>
+          </div>
 
           <button
             type="button"
@@ -237,19 +303,40 @@ export const SingleCameraView: React.FC<SingleCameraViewProps> = ({
             onRecordingComplete={onRecordingComplete}
           />
 
-          {/* Compact In-Video Quick Action HUD (No duplicate PTZ or Record buttons) */}
+          {irStatusLabel && (
+            <div className="absolute top-3 left-3 px-2.5 py-1 bg-slate-950/80 border border-slate-800 text-[11px] font-mono text-slate-300 rounded pointer-events-none">
+              {irStatusLabel}
+            </div>
+          )}
+
+          {/* Compact In-Video Quick Action HUD */}
           <div className="absolute bottom-3 right-3 flex flex-wrap items-center gap-1.5 bg-slate-950/85 backdrop-blur-sm border border-slate-800 rounded-lg p-1.5">
             <button
               type="button"
               onClick={onToggleLight}
-              title="Encender o apagar luz"
+              disabled={lightBusy}
+              title="Encender o apagar luz / linterna integrada"
               aria-label="Encender o apagar luz"
-              className={`flex items-center gap-1 px-2 py-1 text-xs rounded transition-colors cursor-pointer ${
+              className={`flex items-center gap-1 px-2 py-1 text-xs rounded transition-colors cursor-pointer disabled:opacity-60 ${
                 lightOn ? 'bg-amber-500/25 text-amber-300' : 'text-slate-200 hover:bg-slate-800'
               }`}
             >
-              <Lightbulb className="w-3.5 h-3.5" />
-              <span className="hidden sm:inline">{lightOn ? 'Luz ON' : 'Luz'}</span>
+              <Lightbulb className={`w-3.5 h-3.5 ${lightBusy ? 'animate-pulse text-amber-300' : ''}`} />
+              <span>{lightBusy ? 'Luz...' : lightOn ? 'Luz ON' : 'Luz'}</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => onVisionModeChange(visionMode === 'night' ? 'normal' : 'night')}
+              title={visionMode === 'night' ? 'Cambiar a Día (Sin IR)' : 'Activar Visión Nocturna e IR'}
+              aria-label="Alternar visión nocturna e infrarrojo"
+              className={`flex items-center gap-1 px-2 py-1 text-xs rounded transition-colors cursor-pointer ${
+                visionMode === 'night'
+                  ? 'bg-emerald-600/30 text-emerald-300'
+                  : 'text-slate-200 hover:bg-slate-800'
+              }`}
+            >
+              {visionMode === 'night' ? <Moon className="w-3.5 h-3.5" /> : <Sun className="w-3.5 h-3.5" />}
+              <span>{visionMode === 'night' ? 'IR ON' : 'Sin IR'}</span>
             </button>
             <button
               type="button"
@@ -428,7 +515,7 @@ export const SingleCameraView: React.FC<SingleCameraViewProps> = ({
         </div>
       </div>
 
-      {/* Bottom Tabbed Panel: Motion Events, Clips, Processes & Connections */}
+      {/* Bottom Tabbed Panel: Motion Events, Clips, Processes, Diagnostics */}
       <div className="bg-slate-900 border border-slate-800 rounded-xl overflow-hidden">
         <div className="px-4 py-2.5 border-b border-slate-800 flex flex-wrap items-center justify-between gap-2">
           <div className="flex flex-wrap items-center gap-1.5">
@@ -463,7 +550,22 @@ export const SingleCameraView: React.FC<SingleCameraViewProps> = ({
                   : 'text-slate-400 hover:text-slate-200'
               }`}
             >
-              Procesos y Conexiones ({activeProcessCount} activos)
+              Procesos ({activeProcessCount} activos)
+            </button>
+            <button
+              type="button"
+              onClick={() => onBottomTabChange('diagnostics')}
+              className={`flex items-center gap-1.5 px-3 py-1 text-xs font-medium rounded-md transition-colors cursor-pointer ${
+                bottomTab === 'diagnostics'
+                  ? 'bg-slate-800 text-slate-100'
+                  : 'text-slate-400 hover:text-slate-200'
+              }`}
+            >
+              <Activity className="w-3.5 h-3.5 text-sky-400" />
+              <span>
+                Diagnóstico
+                {diagErrorCount > 0 ? ` (${diagErrorCount} fallos)` : ''}
+              </span>
             </button>
           </div>
 
@@ -538,6 +640,19 @@ export const SingleCameraView: React.FC<SingleCameraViewProps> = ({
               operations={operations}
               onRefresh={onRefreshProcesses}
               onKill={onKillProcess}
+            />
+          )}
+
+          {bottomTab === 'diagnostics' && (
+            <DiagnosticsPanel
+              cameraIp={camera.ip}
+              openPorts={camera.openPorts}
+              checks={diagnosticChecks}
+              samples={diagnosticSamples}
+              isRunningCheck={isRunningDiagnostic}
+              onRunDiagnostic={onRunDiagnostic}
+              onRefreshSamples={onRefreshDiagnostics}
+              onClearSamples={onClearDiagnostics}
             />
           )}
         </div>

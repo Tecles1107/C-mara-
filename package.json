@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "tsx server.ts",
     "start": "node server.ts",
+    "start:termux": "NODE_ENV=production tsx server.ts",
     "build": "vite build",
     "preview": "vite preview",
     "clean": "rm -rf dist server.js",

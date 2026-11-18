@@ -3,6 +3,8 @@ import assert from 'node:assert/strict';
 import {
   DEFAULT_MOTION_CONFIG,
   buildStreamUrl,
+  resolveEffectiveEndpoint,
+  mergeCameraLists,
   parseSubnetInputs,
   filterCameras,
   clampZoomPan,
@@ -62,12 +64,44 @@ const TEST_CAMERAS = [
   },
 ];
 
-test('buildStreamUrl embeds credentials when provided', () => {
+test('buildStreamUrl embeds credentials and resolves remote endpoints when active', () => {
   assert.equal(buildStreamUrl(TEST_CAMERAS[0]), 'rtsp://192.168.1.104:554/live');
   assert.equal(
     buildStreamUrl({ ...TEST_CAMERAS[0], username: 'admin', password: 'p@ss' }),
     'rtsp://admin:p%40ss@192.168.1.104:554/live'
   );
+
+  const remoteCam = {
+    ...TEST_CAMERAS[0],
+    remoteHost: 'mi-casa.duckdns.org',
+    remotePort: 8554,
+    connectionMode: 'remote' as const,
+  };
+  const endpoint = resolveEffectiveEndpoint(remoteCam);
+  assert.equal(endpoint.isRemote, true);
+  assert.equal(endpoint.host, 'mi-casa.duckdns.org');
+  assert.equal(endpoint.port, 8554);
+  assert.equal(buildStreamUrl(remoteCam), 'rtsp://mi-casa.duckdns.org:8554/live');
+});
+
+test('mergeCameraLists preserves saved names, credentials, and remote configs', () => {
+  const saved = [
+    {
+      ...TEST_CAMERAS[0],
+      name: 'Portón Principal',
+      remoteHost: 'casa.duckdns.org',
+      isSaved: true,
+    },
+  ];
+  const discovered = [
+    { ...TEST_CAMERAS[0], name: 'Cámara 192.168.1.104', status: 'online' as const, latencyMs: 12 },
+    TEST_CAMERAS[1],
+  ];
+  const merged = mergeCameraLists(saved, discovered);
+  assert.equal(merged.length, 2);
+  assert.equal(merged[0].name, 'Portón Principal');
+  assert.equal(merged[0].remoteHost, 'casa.duckdns.org');
+  assert.equal(merged[0].latencyMs, 12);
 });
 
 test('parseSubnetInputs normalizes multi-subnet and CIDR strings', () => {
@@ -130,8 +164,10 @@ test('formatDuration and formatBytes format cleanly', () => {
   assert.equal(formatBytes(2048), '2.0 KB');
 });
 
-test('buildTermuxScript includes subnet and port', () => {
-  const script = buildTermuxScript('10.0.0.0/24', 8080);
+test('buildTermuxScript includes subnet, port, and remote tunnel option', () => {
+  const script = buildTermuxScript('10.0.0.0/24', 8080, 'cloudflared');
   assert.ok(script.includes('10.0.0.0/24'));
-  assert.ok(script.includes('--port=8080'));
+  assert.ok(script.includes('PORT=8080'));
+  assert.ok(script.includes('cloudflared tunnel'));
 });
+

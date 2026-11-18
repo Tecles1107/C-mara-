@@ -1,8 +1,10 @@
 import crypto from 'node:crypto';
 import dgram from 'node:dgram';
+import fs from 'node:fs/promises';
 import os from 'node:os';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import { encodePcmToG711, extractPcm16Mono8k } from './rtspBackchannel.ts';
 
 const execFileAsync = promisify(execFile);
 
@@ -13,14 +15,55 @@ export interface OnvifDeviceProfile {
   ptzUrl?: string;
   imagingUrl?: string;
   profileToken?: string;
+  videoSourceToken?: string;
   streamUri?: string;
   manufacturer?: string;
   model?: string;
   ptzSupported: boolean;
   imagingSupported: boolean;
+  relayTokens?: string[];
+}
+
+export interface HardwareControlResult {
+  ok: boolean;
+  method?: string;
+  attempts: string[];
+  error?: string;
+  authError?: boolean;
 }
 
 const onvifCache = new Map<string, OnvifDeviceProfile>();
+const isapiTalkOpenCache = new Map<string, number>();
+
+export function buildCandidateHttpPorts(
+  port?: number,
+  onvifPort?: number,
+  openPorts?: number[]
+): number[] {
+  const rtspPorts = new Set([554, 8554, 10554, 34567, 37777]);
+  const raw = [
+    onvifPort,
+    ...(openPorts || []),
+    port && !rtspPorts.has(port) ? port : undefined,
+    80,
+    8000,
+    8080,
+    8899,
+    81,
+    5000,
+  ];
+  const seen = new Set<number>();
+  const result: number[] = [];
+  for (const p of raw) {
+    const num = Number(p);
+    if (!Number.isInteger(num) || num <= 0 || num > 65535 || rtspPorts.has(num) || seen.has(num)) {
+      continue;
+    }
+    seen.add(num);
+    result.push(num);
+  }
+  return result;
+}
 
 export function getAllLocalIPv4Addresses(): Array<{ address: string; subnet: string }> {
   const interfaces = os.networkInterfaces();
@@ -43,6 +86,27 @@ export function getAllLocalIPv4Addresses(): Array<{ address: string; subnet: str
 }
 
 function buildWsSecurityHeader(username?: string, password?: string): string {
+  if (!username) return '';
+  const nonceBytes = crypto.randomBytes(16);
+  const created = new Date().toISOString();
+  const digest = crypto
+    .createHash('sha1')
+    .update(Buffer.concat([nonceBytes, Buffer.from(created, 'utf8'), Buffer.from(password || '', 'utf8')]))
+    .digest('base64');
+
+  return `<s:Header>
+    <Security s:mustUnderstand="1" xmlns="http://docs.oasis-open.org/wss/2004/01/oasis-open-wss-wssecurity-secext-1.0.xsd">
+      <UsernameToken>
+        <Username>${escapeXml(username)}</Username>
+        <Password Type="http://docs.oasis-open.org/wss/2004/01/oasis-open-wss-username-token-profile-1.0#PasswordDigest">${digest}</Password>
+        <Nonce EncodingType="http://docs.oasis-open.org/wss/2004/01/oasis-open-wss-soap-message-security-1.0#Base64Binary">${nonceBytes.toString('base64')}</Nonce>
+        <Created xmlns="http://docs.oasis-open.org/wss/2004/01/oasis-open-wss-wssecurity-utility-1.0.xsd">${created}</Created>
+      </UsernameToken>
+    </Security>
+  </s:Header>`;
+}
+
+function buildWsSecurityStandardHeader(username?: string, password?: string): string {
   if (!username) return '';
   const nonceBytes = crypto.randomBytes(16);
   const created = new Date().toISOString();
@@ -142,16 +206,50 @@ export async function fetchWithAuth(
   }
 }
 
+function isValidCgiSuccessResponse(res: Response, bodyText: string): boolean {
+  if (!res.ok) return false;
+  const contentType = (res.headers.get('content-type') || '').toLowerCase();
+  const trimmed = bodyText.trim();
+  const lower = trimmed.toLowerCase();
+
+  // Reject HTML web pages / SPA fallbacks / router login pages served with HTTP 200
+  if (
+    contentType.includes('text/html') ||
+    lower.startsWith('<!doctype') ||
+    lower.startsWith('<html') ||
+    lower.includes('<script') ||
+    lower.includes('</head>')
+  ) {
+    return false;
+  }
+
+  // Reject explicit camera CGI / ISAPI failure payloads returned inside HTTP 200
+  if (
+    lower.includes('bad parameter') ||
+    lower.includes('not support') ||
+    lower.includes('unknown command') ||
+    lower.includes('invalid operation') ||
+    lower.includes('<statuscode>4</statuscode>') ||
+    lower.includes('<statuscode>5</statuscode>') ||
+    lower.includes('<statuscode>6</statuscode>') ||
+    lower.startsWith('error')
+  ) {
+    return false;
+  }
+
+  return true;
+}
+
 async function soapRequest(
   url: string,
   bodyXml: string,
   username?: string,
   password?: string,
-  timeoutMs = 2000
+  timeoutMs = 1800
 ): Promise<{ ok: boolean; status: number; text: string }> {
   const envelope = `<?xml version="1.0" encoding="utf-8"?>
 <s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope">
-  ${buildWsSecurityHeader(username, password)}
+  ${buildWsSecurityStandardHeader(username, password)}
   <s:Body>${bodyXml}</s:Body>
 </s:Envelope>`;
 
@@ -165,36 +263,48 @@ async function soapRequest(
       timeoutMs,
     });
     const text = await res.text();
-    return { ok: res.ok && !text.includes(':Fault>'), status: res.status, text };
+    const isFault = text.includes(':Fault>') || text.includes('<Fault>');
+    const isSoapXml =
+      text.includes(':Envelope') ||
+      text.includes('<Envelope') ||
+      text.includes(':Body') ||
+      text.includes('<Body');
+    const valid = res.ok && !isFault && isValidCgiSuccessResponse(res, text) && isSoapXml;
+    return { ok: valid, status: res.status, text };
   } catch {
     return { ok: false, status: 0, text: '' };
   }
 }
+
+// Unused alternate namespace retained only internally if needed
+void buildWsSecurityHeader;
 
 export async function resolveOnvifProfile(
   ip: string,
   preferredPort?: number,
   username?: string,
   password?: string,
-  forceRefresh = false
+  forceRefresh = false,
+  extraPorts?: number[]
 ): Promise<OnvifDeviceProfile | null> {
   const cacheKey = `${ip}:${preferredPort || 'auto'}:${username || ''}`;
   if (!forceRefresh && onvifCache.has(cacheKey)) {
     return onvifCache.get(cacheKey)!;
   }
 
-  const candidatePorts = Array.from(
-    new Set([preferredPort, 80, 8899, 8000, 8080, 5000, 2020].filter((p): p is number => Boolean(p && p !== 554 && p !== 8554)))
+  const candidatePorts = buildCandidateHttpPorts(preferredPort, preferredPort, extraPorts).filter(
+    (p) => p !== 81
   );
+  if (!candidatePorts.includes(2020)) candidatePorts.push(2020);
 
-  for (const port of candidatePorts) {
+  for (const port of candidatePorts.slice(0, 7)) {
     const deviceUrl = `http://${ip}:${port}/onvif/device_service`;
     const capRes = await soapRequest(
       deviceUrl,
       `<GetCapabilities xmlns="http://www.onvif.org/ver10/device/wsdl"><Category>All</Category></GetCapabilities>`,
       username,
       password,
-      1400
+      1200
     );
 
     if (!capRes.ok) continue;
@@ -214,7 +324,7 @@ export async function resolveOnvifProfile(
       `<GetDeviceInformation xmlns="http://www.onvif.org/ver10/device/wsdl"/>`,
       username,
       password,
-      1200
+      1000
     );
     if (infoRes.ok) {
       manufacturer = infoRes.text.match(/<[^:]*:?Manufacturer>([^<]+)<\/[^:]*:?Manufacturer>/i)?.[1];
@@ -222,16 +332,30 @@ export async function resolveOnvifProfile(
     }
 
     let profileToken = 'Profile_1';
-    const profilesRes = await soapRequest(
-      mediaUrl,
-      `<GetProfiles xmlns="http://www.onvif.org/ver10/media/wsdl"/>`,
-      username,
-      password,
-      1400
-    );
+    let videoSourceToken: string | undefined;
+    const [profilesRes, videoSourcesRes, relayRes] = await Promise.all([
+      soapRequest(mediaUrl, `<GetProfiles xmlns="http://www.onvif.org/ver10/media/wsdl"/>`, username, password, 1200),
+      soapRequest(mediaUrl, `<GetVideoSources xmlns="http://www.onvif.org/ver10/media/wsdl"/>`, username, password, 1000),
+      soapRequest(deviceUrl, `<GetRelayOutputs xmlns="http://www.onvif.org/ver10/device/wsdl"/>`, username, password, 1000),
+    ]);
+
     if (profilesRes.ok) {
       const tokenMatch = profilesRes.text.match(/<[^:]*:?Profiles[^>]+token="([^"]+)"/i);
       if (tokenMatch) profileToken = tokenMatch[1];
+      const srcTokenInProfile = profilesRes.text.match(/<[^:]*:?SourceToken>([^<]+)<\/[^:]*:?SourceToken>/i);
+      if (srcTokenInProfile) videoSourceToken = srcTokenInProfile[1];
+    }
+    if (videoSourcesRes.ok && !videoSourceToken) {
+      const vsMatch = videoSourcesRes.text.match(/<[^:]*:?VideoSources[^>]+token="([^"]+)"/i);
+      if (vsMatch) videoSourceToken = vsMatch[1];
+    }
+
+    const relayTokens: string[] = [];
+    if (relayRes.ok) {
+      const matches = relayRes.text.matchAll(/<[^:]*:?RelayOutputs[^>]+token="([^"]+)"/gi);
+      for (const m of matches) {
+        if (m[1]) relayTokens.push(m[1]);
+      }
     }
 
     let streamUri: string | undefined;
@@ -243,7 +367,7 @@ export async function resolveOnvifProfile(
       </GetStreamUri>`,
       username,
       password,
-      1400
+      1200
     );
     if (uriRes.ok) {
       const uriMatch = uriRes.text.match(/<[^:]*:?Uri>([^<]+)<\/[^:]*:?Uri>/i);
@@ -257,11 +381,13 @@ export async function resolveOnvifProfile(
       ptzUrl,
       imagingUrl,
       profileToken,
+      videoSourceToken: videoSourceToken || 'VideoSource_1',
       streamUri,
       manufacturer,
       model,
       ptzSupported: Boolean(ptzMatch),
       imagingSupported: Boolean(imagingMatch),
+      relayTokens,
     };
     onvifCache.set(cacheKey, profile);
     return profile;
@@ -274,20 +400,29 @@ export async function moveOnvifOrCgiPtz(params: {
   ip: string;
   port?: number;
   onvifPort?: number;
+  openPorts?: number[];
   profileToken?: string;
   username?: string;
   password?: string;
   direction: 'up' | 'down' | 'left' | 'right' | 'stop';
   speed?: number;
   stepMs?: number;
-}): Promise<{ ok: boolean; method?: string; error?: string }> {
-  const { ip, port = 80, onvifPort, profileToken, username, password, direction, speed = 0.25, stepMs = 260 } = params;
+}): Promise<{ ok: boolean; method?: string; error?: string; authError?: boolean }> {
+  const { ip, port = 80, onvifPort, openPorts, profileToken, username, password, direction, speed = 0.25, stepMs = 260 } = params;
   const clampedSpeed = Math.min(1, Math.max(0.08, Number(speed) || 0.25));
   const x = direction === 'left' ? -clampedSpeed : direction === 'right' ? clampedSpeed : 0;
   const y = direction === 'up' ? clampedSpeed : direction === 'down' ? -clampedSpeed : 0;
 
-  const profile = await resolveOnvifProfile(ip, onvifPort || (port !== 554 ? port : undefined), username, password);
-  const ptzUrl = profile?.ptzUrl || `http://${ip}:${onvifPort || (port === 554 ? 80 : port)}/onvif/ptz_service`;
+  const profile = await resolveOnvifProfile(
+    ip,
+    onvifPort || (port !== 554 ? port : undefined),
+    username,
+    password,
+    false,
+    openPorts
+  );
+  const httpPorts = buildCandidateHttpPorts(port, profile?.onvifPort || onvifPort, openPorts);
+  const ptzUrl = profile?.ptzUrl || `http://${ip}:${httpPorts[0] || 80}/onvif/ptz_service`;
   const token = profileToken || profile?.profileToken || 'Profile_1';
 
   const stopSoap = `<tptz:Stop xmlns:tptz="http://www.onvif.org/ver20/ptz/wsdl">
@@ -296,11 +431,14 @@ export async function moveOnvifOrCgiPtz(params: {
     <tptz:Zoom>false</tptz:Zoom>
   </tptz:Stop>`;
 
+  let sawAuthError = false;
+
   if (direction === 'stop') {
     const res = await soapRequest(ptzUrl, stopSoap, username, password, 1200);
+    if (res.status === 401) sawAuthError = true;
     if (res.ok) return { ok: true, method: 'onvif-stop' };
   } else {
-    // 1. Prefer RelativeMove so a single press NEVER causes continuous spinning!
+    // 1. Prefer RelativeMove so a single press NEVER causes continuous spinning
     const relX = direction === 'left' ? -clampedSpeed * 0.28 : direction === 'right' ? clampedSpeed * 0.28 : 0;
     const relY = direction === 'up' ? clampedSpeed * 0.28 : direction === 'down' ? -clampedSpeed * 0.28 : 0;
     const relSoap = `<tptz:RelativeMove xmlns:tptz="http://www.onvif.org/ver20/ptz/wsdl">
@@ -308,6 +446,7 @@ export async function moveOnvifOrCgiPtz(params: {
       <tptz:Translation><tt:PanTilt x="${relX.toFixed(3)}" y="${relY.toFixed(3)}" xmlns:tt="http://www.onvif.org/ver10/schema"/></tptz:Translation>
     </tptz:RelativeMove>`;
     const relRes = await soapRequest(ptzUrl, relSoap, username, password, 1200);
+    if (relRes.status === 401) sawAuthError = true;
     if (relRes.ok) {
       return { ok: true, method: 'onvif-relative' };
     }
@@ -320,6 +459,7 @@ export async function moveOnvifOrCgiPtz(params: {
       <tptz:Timeout>PT${timeoutSec}S</tptz:Timeout>
     </tptz:ContinuousMove>`;
     const contRes = await soapRequest(ptzUrl, contSoap, username, password, 1200);
+    if (contRes.status === 401) sawAuthError = true;
     if (contRes.ok) {
       setTimeout(() => {
         soapRequest(ptzUrl, stopSoap, username, password, 1000).catch(() => {});
@@ -328,52 +468,58 @@ export async function moveOnvifOrCgiPtz(params: {
     }
   }
 
-  // 3. Vendor HTTP CGI PTZ fallbacks (Hikvision ISAPI, Dahua, Foscam/VStarcam)
-  const httpPort = onvifPort || (port === 554 ? 80 : port);
+  // 3. Vendor HTTP CGI PTZ fallbacks across candidate HTTP ports
   const dahuaCode = direction === 'up' ? 'Up' : direction === 'down' ? 'Down' : direction === 'left' ? 'Left' : 'Right';
   const foscamCmd = direction === 'stop' ? 1 : direction === 'up' ? 0 : direction === 'down' ? 2 : direction === 'left' ? 4 : 6;
-  const cgiCandidates: Array<{ url: string; method?: string; body?: string }> = [
-    {
-      url: `http://${ip}:${httpPort}/cgi-bin/ptz.cgi?action=${direction === 'stop' ? 'stop' : 'start'}&channel=1&code=${dahuaCode}&arg1=0&arg2=${Math.max(1, Math.round(clampedSpeed * 8))}&arg3=0`,
-    },
-    {
-      url: `http://${ip}:${httpPort}/decoder_control.cgi?command=${foscamCmd}&onestep=1`,
-    },
-    {
-      url: `http://${ip}:${httpPort}/ISAPI/PTZCtrl/channels/1/continuous`,
-      method: 'PUT',
-      body: `<PTZData><pan>${Math.round(x * 100)}</pan><tilt>${Math.round(y * 100)}</tilt></PTZData>`,
-    },
-  ];
+  for (const httpPort of httpPorts.slice(0, 4)) {
+    const cgiCandidates: Array<{ url: string; method?: string; body?: string }> = [
+      {
+        url: `http://${ip}:${httpPort}/cgi-bin/ptz.cgi?action=${direction === 'stop' ? 'stop' : 'start'}&channel=1&code=${dahuaCode}&arg1=0&arg2=${Math.max(1, Math.round(clampedSpeed * 8))}&arg3=0`,
+      },
+      {
+        url: `http://${ip}:${httpPort}/decoder_control.cgi?command=${foscamCmd}&onestep=1`,
+      },
+      {
+        url: `http://${ip}:${httpPort}/ISAPI/PTZCtrl/channels/1/continuous`,
+        method: 'PUT',
+        body: `<PTZData><pan>${Math.round(x * 100)}</pan><tilt>${Math.round(y * 100)}</tilt></PTZData>`,
+      },
+    ];
 
-  for (const c of cgiCandidates) {
-    try {
-      const r = await fetchWithAuth(c.url, {
-        method: c.method || 'GET',
-        body: c.body,
-        username,
-        password,
-        timeoutMs: 1200,
-      });
-      if (r.ok) {
-        if (direction !== 'stop' && c.url.includes('ptz.cgi')) {
-          setTimeout(() => {
-            fetchWithAuth(
-              `http://${ip}:${httpPort}/cgi-bin/ptz.cgi?action=stop&channel=1&code=${dahuaCode}&arg1=0&arg2=0&arg3=0`,
-              { username, password, timeoutMs: 1000 }
-            ).catch(() => {});
-          }, Math.min(400, stepMs));
+    for (const c of cgiCandidates) {
+      try {
+        const r = await fetchWithAuth(c.url, {
+          method: c.method || 'GET',
+          body: c.body,
+          username,
+          password,
+          timeoutMs: 900,
+        });
+        if (r.status === 401) sawAuthError = true;
+        const bodyText = r.ok ? await r.text().catch(() => '') : '';
+        if (isValidCgiSuccessResponse(r, bodyText)) {
+          if (direction !== 'stop' && c.url.includes('ptz.cgi')) {
+            setTimeout(() => {
+              fetchWithAuth(
+                `http://${ip}:${httpPort}/cgi-bin/ptz.cgi?action=stop&channel=1&code=${dahuaCode}&arg1=0&arg2=0&arg3=0`,
+                { username, password, timeoutMs: 900 }
+              ).catch(() => {});
+            }, Math.min(400, stepMs));
+          }
+          return { ok: true, method: `http-cgi:${httpPort}` };
         }
-        return { ok: true, method: 'http-cgi' };
+      } catch {
+        // Try next
       }
-    } catch {
-      // Try next CGI endpoint
     }
   }
 
   return {
     ok: false,
-    error: 'La cámara no respondió a PTZ (verifica el puerto ONVIF/HTTP o credenciales).',
+    authError: sawAuthError,
+    error: sawAuthError
+      ? 'La cámara rechazó las credenciales (HTTP 401) al mover PTZ.'
+      : 'La cámara no respondió a PTZ (verifica puerto ONVIF/HTTP o soporte motorizado).',
   };
 }
 
@@ -381,19 +527,43 @@ export async function toggleCameraLight(params: {
   ip: string;
   port?: number;
   onvifPort?: number;
+  openPorts?: number[];
   username?: string;
   password?: string;
   on: boolean;
-}): Promise<{ ok: boolean; method?: string; error?: string }> {
-  const { ip, port = 80, onvifPort, username, password, on } = params;
-  const httpPort = onvifPort || (port === 554 ? 80 : port);
+}): Promise<HardwareControlResult> {
+  const { ip, port = 80, onvifPort, openPorts, username, password, on } = params;
+  const httpPorts = buildCandidateHttpPorts(port, onvifPort, openPorts);
+  const attempts: string[] = [];
+  let sawAuthError = false;
 
-  // 1. Try ONVIF Auxiliary Command (Spotlight / WhiteLight / Relay) & Imaging IR/Light
-  const profile = await resolveOnvifProfile(ip, httpPort, username, password);
+  // 1. ONVIF: RelayOutputs, AuxiliaryCommand (WhiteLight/Spotlight/Light/FloodLight), Imaging WhiteLight
+  const profile = await resolveOnvifProfile(ip, onvifPort || (port !== 554 ? port : undefined), username, password, false, openPorts);
   if (profile) {
     const devUrl = `http://${ip}:${profile.onvifPort}/onvif/device_service`;
+
+    for (const relayToken of profile.relayTokens || []) {
+      const relayRes = await soapRequest(
+        devUrl,
+        `<SetRelayOutputState xmlns="http://www.onvif.org/ver10/device/wsdl">
+          <RelayOutputToken>${escapeXml(relayToken)}</RelayOutputToken>
+          <LogicalState>${on ? 'active' : 'inactive'}</LogicalState>
+        </SetRelayOutputState>`,
+        username,
+        password,
+        1000
+      );
+      if (relayRes.status === 401) sawAuthError = true;
+      attempts.push(`ONVIF Relay(${relayToken}):${relayRes.status || 'err'}`);
+      if (relayRes.ok) {
+        return { ok: true, method: `onvif-relay:${relayToken}`, attempts };
+      }
+    }
+
     const auxCommands = [
+      `tt:WhiteLight|${on ? 'On' : 'Off'}`,
       `tt:Spotlight|${on ? 'On' : 'Off'}`,
+      `tt:FloodLight|${on ? 'On' : 'Off'}`,
       `tt:Light|${on ? 'On' : 'Off'}`,
       `tt:IRLamp|${on ? 'On' : 'Off'}`,
     ];
@@ -403,68 +573,421 @@ export async function toggleCameraLight(params: {
         `<SendAuxiliaryCommand xmlns="http://www.onvif.org/ver10/device/wsdl"><AuxiliaryCommand>${cmd}</AuxiliaryCommand></SendAuxiliaryCommand>`,
         username,
         password,
-        1000
+        900
       );
-      if (auxRes.ok) return { ok: true, method: `onvif-aux:${cmd}` };
+      if (auxRes.status === 401) sawAuthError = true;
+      attempts.push(`ONVIF Aux(${cmd}):${auxRes.status || 'err'}`);
+      if (auxRes.ok) return { ok: true, method: `onvif-aux:${cmd}`, attempts };
     }
-  }
 
-  // 2. Try standard HTTP CGI spotlight / LED / IR endpoints across brands
-  const val = on ? 255 : 0;
-  const candidates: Array<{ url: string; method?: string; body?: string }> = [
-    { url: `http://${ip}:${httpPort}/control?var=led_intensity&val=${val}` },
-    { url: `http://${ip}:${httpPort}/led?state=${on ? 1 : 0}` },
-    { url: `http://${ip}:${httpPort}/cgi-bin/hi3510/param.cgi?cmd=setinfrared&-infraredstat=${on ? 'open' : 'close'}` },
-    { url: `http://${ip}:${httpPort}/cgi-bin/configManager.cgi?action=setConfig&Lighting[0][0].Mode=${on ? 'Manual' : 'Off'}` },
-    { url: `http://${ip}:${httpPort}/cgi-bin/configManager.cgi?action=setConfig&Lighting_V2[0][0][0].Mode=${on ? 'Manual' : 'Off'}` },
-    {
-      url: `http://${ip}:${httpPort}/ISAPI/System/Hardware`,
-      method: 'PUT',
-      body: `<Hardware><supplementLight><enabled>${on ? 'true' : 'false'}</enabled></supplementLight></Hardware>`,
-    },
-    { url: `http://${ip}:${httpPort}/set_misc.cgi?led_mode=${on ? 1 : 0}` },
-  ];
-
-  for (const c of candidates) {
-    try {
-      const r = await fetchWithAuth(c.url, {
-        method: c.method || 'GET',
-        body: c.body,
+    if (profile.imagingUrl && profile.videoSourceToken) {
+      const imgRes = await soapRequest(
+        profile.imagingUrl,
+        `<timg:SetImagingSettings xmlns:timg="http://www.onvif.org/ver20/imaging/wsdl">
+          <timg:VideoSourceToken>${escapeXml(profile.videoSourceToken)}</timg:VideoSourceToken>
+          <timg:ImagingSettings>
+            <tt:WhiteLight xmlns:tt="http://www.onvif.org/ver10/schema">${on ? 'ON' : 'OFF'}</tt:WhiteLight>
+          </timg:ImagingSettings>
+        </timg:SetImagingSettings>`,
         username,
         password,
-        timeoutMs: 1200,
-      });
-      if (r.ok) {
-        return { ok: true, method: c.url };
+        1000
+      );
+      if (imgRes.status === 401) sawAuthError = true;
+      attempts.push(`ONVIF WhiteLight:${imgRes.status || 'err'}`);
+      if (imgRes.ok) return { ok: true, method: 'onvif-imaging-whitelight', attempts };
+    }
+  } else {
+    attempts.push(`ONVIF(sin respuesta en ${httpPorts.slice(0, 4).join(',')})`);
+  }
+
+  // 2. Multi-port vendor HTTP CGI spotlight / LED / Floodlight endpoints
+  const val = on ? 255 : 0;
+  for (const httpPort of httpPorts.slice(0, 5)) {
+    const candidates: Array<{ label: string; url: string; method?: string; body?: string; headers?: Record<string, string> }> = [
+      {
+        label: 'ISAPI SupplementLight',
+        url: `http://${ip}:${httpPort}/ISAPI/Image/channels/1/supplementLight`,
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/xml' },
+        body: `<SupplementLight><supplementLightMode>${on ? 'open' : 'close'}</supplementLightMode></SupplementLight>`,
+      },
+      {
+        label: 'ISAPI Hardware Light',
+        url: `http://${ip}:${httpPort}/ISAPI/System/Hardware`,
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/xml' },
+        body: `<Hardware><supplementLight><enabled>${on ? 'true' : 'false'}</enabled></supplementLight></Hardware>`,
+      },
+      {
+        label: 'Dahua Lighting_V2',
+        url: `http://${ip}:${httpPort}/cgi-bin/configManager.cgi?action=setConfig&Lighting_V2[0][0][0].Mode=${on ? 'Manual' : 'Off'}`,
+      },
+      {
+        label: 'Dahua Lighting',
+        url: `http://${ip}:${httpPort}/cgi-bin/configManager.cgi?action=setConfig&Lighting[0][0].Mode=${on ? 'Manual' : 'Off'}`,
+      },
+      {
+        label: 'Hi3510 setlight',
+        url: `http://${ip}:${httpPort}/cgi-bin/hi3510/param.cgi?cmd=setlight&-light=${on ? 1 : 0}`,
+      },
+      {
+        label: 'Hi3510 setwhiteled',
+        url: `http://${ip}:${httpPort}/cgi-bin/hi3510/param.cgi?cmd=setwhiteled&-state=${on ? 'open' : 'close'}`,
+      },
+      {
+        label: 'Hi3510 setinfrared',
+        url: `http://${ip}:${httpPort}/cgi-bin/hi3510/param.cgi?cmd=setinfrared&-infraredstat=${on ? 'open' : 'close'}`,
+      },
+      {
+        label: 'Foscam WhiteLight',
+        url: `http://${ip}:${httpPort}/cgi-bin/CGIProxy.fcgi?cmd=setWhiteLightState&state=${on ? 1 : 0}`,
+      },
+      {
+        label: 'Generic set_misc LED',
+        url: `http://${ip}:${httpPort}/set_misc.cgi?led_mode=${on ? 1 : 0}`,
+      },
+      {
+        label: 'ESP32 LED PWM',
+        url: `http://${ip}:${httpPort}/control?var=led_intensity&val=${val}`,
+      },
+      {
+        label: 'HTTP LED',
+        url: `http://${ip}:${httpPort}/led?state=${on ? 1 : 0}`,
+      },
+    ];
+
+    const batchResults = await Promise.all(
+      candidates.map(async (c) => {
+        try {
+          const r = await fetchWithAuth(c.url, {
+            method: c.method || 'GET',
+            headers: c.headers,
+            body: c.body,
+            username,
+            password,
+            timeoutMs: 850,
+          });
+          const txt = r.ok ? await r.text().catch(() => '') : '';
+          const valid = isValidCgiSuccessResponse(r, txt);
+          return { ...c, status: r.status, ok: valid, rejectedHtml: r.ok && !valid };
+        } catch {
+          return { ...c, status: 0, ok: false, rejectedHtml: false };
+        }
+      })
+    );
+
+    for (const r of batchResults) {
+      if (r.status === 401) sawAuthError = true;
+      if (r.status > 0) {
+        attempts.push(
+          `${r.label}(:${httpPort})->HTTP ${r.status}${r.rejectedHtml ? ' (HTML/no CGI)' : ''}`
+        );
       }
-    } catch {
-      // Try next endpoint
+      if (r.ok) {
+        return { ok: true, method: `${r.label} (:${httpPort})`, attempts };
+      }
     }
   }
 
   return {
     ok: false,
-    error: 'La cámara no expone control remoto de linterna/LED o requiere credenciales.',
+    attempts,
+    authError: sawAuthError,
+    error: sawAuthError
+      ? `Credenciales rechazadas (HTTP 401) al intentar encender/apagar la luz en ${ip}.`
+      : `La cámara (${ip}) no expuso interfaz compatible de luz/linterna en puertos ${httpPorts.slice(0, 5).join(', ')} (muchas cámaras Tuya/iCSee usan puerto propietario UDP/34567 sin CGI HTTP abierto).`,
+  };
+}
+
+export async function setCameraIrMode(params: {
+  ip: string;
+  port?: number;
+  onvifPort?: number;
+  openPorts?: number[];
+  username?: string;
+  password?: string;
+  mode: 'normal' | 'night' | 'auto';
+}): Promise<HardwareControlResult & { mode: 'normal' | 'night' | 'auto' }> {
+  const { ip, port = 80, onvifPort, openPorts, username, password, mode } = params;
+  const httpPorts = buildCandidateHttpPorts(port, onvifPort, openPorts);
+  const attempts: string[] = [];
+  let sawAuthError = false;
+
+  // ONVIF Spec: IrCutFilter ON = daylight (no IR night vision), OFF = night vision + IR LED, AUTO = automatic
+  const onvifIrCut = mode === 'normal' ? 'ON' : mode === 'night' ? 'OFF' : 'AUTO';
+
+  const profile = await resolveOnvifProfile(
+    ip,
+    onvifPort || (port !== 554 ? port : undefined),
+    username,
+    password,
+    false,
+    openPorts
+  );
+
+  if (profile) {
+    if (profile.imagingUrl) {
+      const srcToken = profile.videoSourceToken || 'VideoSource_1';
+      const imgRes = await soapRequest(
+        profile.imagingUrl,
+        `<timg:SetImagingSettings xmlns:timg="http://www.onvif.org/ver20/imaging/wsdl">
+          <timg:VideoSourceToken>${escapeXml(srcToken)}</timg:VideoSourceToken>
+          <timg:ImagingSettings>
+            <tt:IrCutFilter xmlns:tt="http://www.onvif.org/ver10/schema">${onvifIrCut}</tt:IrCutFilter>
+          </timg:ImagingSettings>
+          <timg:ForcePersistence>true</timg:ForcePersistence>
+        </timg:SetImagingSettings>`,
+        username,
+        password,
+        1200
+      );
+      if (imgRes.status === 401) sawAuthError = true;
+      attempts.push(`ONVIF IrCutFilter=${onvifIrCut}:${imgRes.status || 'err'}`);
+      if (imgRes.ok) {
+        return { ok: true, mode, method: `onvif-imaging:${onvifIrCut}`, attempts };
+      }
+    }
+
+    const devUrl = `http://${ip}:${profile.onvifPort}/onvif/device_service`;
+    const irAux = `tt:IRLamp|${mode === 'night' ? 'On' : mode === 'normal' ? 'Off' : 'Auto'}`;
+    const auxRes = await soapRequest(
+      devUrl,
+      `<SendAuxiliaryCommand xmlns="http://www.onvif.org/ver10/device/wsdl"><AuxiliaryCommand>${irAux}</AuxiliaryCommand></SendAuxiliaryCommand>`,
+      username,
+      password,
+      900
+    );
+    if (auxRes.status === 401) sawAuthError = true;
+    attempts.push(`ONVIF Aux(${irAux}):${auxRes.status || 'err'}`);
+    if (auxRes.ok) {
+      return { ok: true, mode, method: `onvif-aux:${irAux}`, attempts };
+    }
+  } else {
+    attempts.push(`ONVIF(sin respuesta en ${httpPorts.slice(0, 4).join(',')})`);
+  }
+
+  for (const httpPort of httpPorts.slice(0, 5)) {
+    const candidates: Array<{ label: string; url: string; method?: string; body?: string; headers?: Record<string, string> }> = [
+      {
+        label: 'ISAPI IrcutFilter',
+        url: `http://${ip}:${httpPort}/ISAPI/Image/channels/1/ircutFilter`,
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/xml' },
+        body: `<IrcutFilter><IrcutFilterType>${mode === 'normal' ? 'day' : mode === 'night' ? 'night' : 'auto'}</IrcutFilterType></IrcutFilter>`,
+      },
+      {
+        label: 'Dahua VideoInDayNight',
+        url: `http://${ip}:${httpPort}/cgi-bin/configManager.cgi?action=setConfig&VideoInDayNight[0][0].Mode=${mode === 'normal' ? 'Color' : mode === 'night' ? 'BlackWhite' : 'Brightness'}`,
+      },
+      {
+        label: 'Dahua DayNightColor',
+        url: `http://${ip}:${httpPort}/cgi-bin/configManager.cgi?action=setConfig&VideoInOptions[0].DayNightColor=${mode === 'normal' ? 1 : mode === 'night' ? 2 : 0}`,
+      },
+      {
+        label: 'Hi3510 setinfrared',
+        url: `http://${ip}:${httpPort}/cgi-bin/hi3510/param.cgi?cmd=setinfrared&-infraredstat=${mode === 'normal' ? 'close' : mode === 'night' ? 'open' : 'auto'}`,
+      },
+      {
+        label: 'Foscam InfraLed',
+        url: `http://${ip}:${httpPort}/cgi-bin/CGIProxy.fcgi?cmd=setInfraLedConfig&mode=${mode === 'auto' ? 0 : 1}`,
+      },
+    ];
+
+    if (mode !== 'auto') {
+      candidates.push({
+        label: 'Generic Decoder IR',
+        url: `http://${ip}:${httpPort}/decoder_control.cgi?command=${mode === 'night' ? 95 : 94}`,
+      });
+    }
+
+    const batchResults = await Promise.all(
+      candidates.map(async (c) => {
+        try {
+          const r = await fetchWithAuth(c.url, {
+            method: c.method || 'GET',
+            headers: c.headers,
+            body: c.body,
+            username,
+            password,
+            timeoutMs: 900,
+          });
+          const txt = r.ok ? await r.text().catch(() => '') : '';
+          const valid = isValidCgiSuccessResponse(r, txt);
+          return { ...c, status: r.status, ok: valid, rejectedHtml: r.ok && !valid };
+        } catch {
+          return { ...c, status: 0, ok: false, rejectedHtml: false };
+        }
+      })
+    );
+
+    for (const r of batchResults) {
+      if (r.status === 401) sawAuthError = true;
+      if (r.status > 0) {
+        attempts.push(
+          `${r.label}(:${httpPort})->HTTP ${r.status}${r.rejectedHtml ? ' (HTML/no CGI)' : ''}`
+        );
+      }
+      if (r.ok) {
+        return { ok: true, mode, method: `${r.label} (:${httpPort})`, attempts };
+      }
+    }
+  }
+
+  return {
+    ok: false,
+    mode,
+    attempts,
+    authError: sawAuthError,
+    error: sawAuthError
+      ? `Credenciales rechazadas (HTTP 401) al cambiar filtro IR / visión nocturna en ${ip}.`
+      : `La cámara (${ip}) no confirmó el cambio de infrarrojo por ONVIF/CGI; se aplicó el modo visual en pantalla.`,
+  };
+}
+
+export async function sendHttpTwoWayAudio(params: {
+  ip: string;
+  port?: number;
+  onvifPort?: number;
+  openPorts?: number[];
+  username?: string;
+  password?: string;
+  audioBuffer: Buffer;
+  mimeType?: string;
+}): Promise<HardwareControlResult> {
+  const { ip, port = 80, onvifPort, openPorts, username, password, audioBuffer, mimeType = 'audio/wav' } = params;
+  const httpPorts = buildCandidateHttpPorts(port, onvifPort, openPorts);
+  const attempts: string[] = [];
+  let sawAuthError = false;
+
+  const pcm8k = extractPcm16Mono8k(audioBuffer);
+  const g711ulaw = pcm8k.length > 0 ? encodePcmToG711(pcm8k, 'PCMU') : audioBuffer;
+  const g711alaw = pcm8k.length > 0 ? encodePcmToG711(pcm8k, 'PCMA') : audioBuffer;
+
+  for (const httpPort of httpPorts.slice(0, 4)) {
+    // 1. Hikvision ISAPI requires opening the TwoWayAudio channel BEFORE sending /audioData
+    const openKey = `${ip}:${httpPort}`;
+    const lastOpened = isapiTalkOpenCache.get(openKey) || 0;
+    if (Date.now() - lastOpened > 12000) {
+      try {
+        const openRes = await fetchWithAuth(
+          `http://${ip}:${httpPort}/ISAPI/System/TwoWayAudio/channels/1/open`,
+          {
+            method: 'PUT',
+            username,
+            password,
+            timeoutMs: 900,
+          }
+        );
+        if (openRes.status === 401) sawAuthError = true;
+        const openTxt = openRes.ok ? await openRes.text().catch(() => '') : '';
+        const openValid = isValidCgiSuccessResponse(openRes, openTxt);
+        if (openRes.status > 0) attempts.push(`ISAPI open(:${httpPort})->HTTP ${openRes.status}${openRes.ok && !openValid ? ' (HTML)' : ''}`);
+        if (openValid) {
+          isapiTalkOpenCache.set(openKey, Date.now());
+        }
+      } catch {
+        // Not ISAPI
+      }
+    }
+
+    try {
+      const dataRes = await fetchWithAuth(
+        `http://${ip}:${httpPort}/ISAPI/System/TwoWayAudio/channels/1/audioData`,
+        {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/octet-stream' },
+          body: new Uint8Array(g711ulaw),
+          username,
+          password,
+          timeoutMs: 1200,
+        }
+      );
+      if (dataRes.status === 401) sawAuthError = true;
+      const dataTxt = dataRes.ok ? await dataRes.text().catch(() => '') : '';
+      const dataValid = isValidCgiSuccessResponse(dataRes, dataTxt);
+      if (dataRes.status > 0) attempts.push(`ISAPI audioData(:${httpPort})->HTTP ${dataRes.status}${dataRes.ok && !dataValid ? ' (HTML)' : ''}`);
+      if (dataValid) {
+        isapiTalkOpenCache.set(openKey, Date.now());
+        return { ok: true, method: `isapi-twoway:${httpPort}`, attempts };
+      }
+    } catch {
+      // Try next
+    }
+
+    // 2. Dahua HTTP Audio Post
+    try {
+      const dahuaRes = await fetchWithAuth(
+        `http://${ip}:${httpPort}/cgi-bin/audio.cgi?action=postAudio&httptype=singlepart&channel=1`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'Audio/G.711A' },
+          body: new Uint8Array(g711alaw),
+          username,
+          password,
+          timeoutMs: 1200,
+        }
+      );
+      if (dahuaRes.status === 401) sawAuthError = true;
+      const dahuaTxt = dahuaRes.ok ? await dahuaRes.text().catch(() => '') : '';
+      const dahuaValid = isValidCgiSuccessResponse(dahuaRes, dahuaTxt);
+      if (dahuaRes.status > 0) attempts.push(`Dahua audio.cgi(:${httpPort})->HTTP ${dahuaRes.status}${dahuaRes.ok && !dahuaValid ? ' (HTML)' : ''}`);
+      if (dahuaValid) {
+        return { ok: true, method: `dahua-audio:${httpPort}`, attempts };
+      }
+    } catch {
+      // Try next
+    }
+
+    // 3. Hi3510 / CamHi HTTP talk.cgi
+    try {
+      const hiRes = await fetchWithAuth(`http://${ip}:${httpPort}/cgi-bin/hi3510/talk.cgi`, {
+        method: 'POST',
+        headers: { 'Content-Type': mimeType },
+        body: new Uint8Array(g711ulaw),
+        username,
+        password,
+        timeoutMs: 1100,
+      });
+      if (hiRes.status === 401) sawAuthError = true;
+      const hiTxt = hiRes.ok ? await hiRes.text().catch(() => '') : '';
+      const hiValid = isValidCgiSuccessResponse(hiRes, hiTxt);
+      if (hiRes.status > 0) attempts.push(`Hi3510 talk.cgi(:${httpPort})->HTTP ${hiRes.status}${hiRes.ok && !hiValid ? ' (HTML)' : ''}`);
+      if (hiValid) {
+        return { ok: true, method: `hi3510-talk:${httpPort}`, attempts };
+      }
+    } catch {
+      // Try next
+    }
+  }
+
+  return {
+    ok: false,
+    attempts,
+    authError: sawAuthError,
+    error: sawAuthError
+      ? 'Credenciales rechazadas (HTTP 401) para audio bidireccional HTTP.'
+      : 'Ningún endpoint HTTP de audio bidireccional respondió en la cámara.',
   };
 }
 
 export async function probeMediaStream(
   rtspOrHttpUrl: string
-): Promise<{ ok: boolean; resolution?: string; fps?: number; hasAudio?: boolean; authError?: boolean }> {
+): Promise<{ ok: boolean; resolution?: string; fps?: number; hasAudio?: boolean; audioCodec?: string; authError?: boolean }> {
   try {
     const { stdout, stderr } = await execFileAsync(
       'ffprobe',
       [
         '-v', 'error',
         '-rtsp_transport', 'tcp',
-        '-show_entries', 'stream=codec_type,width,height,r_frame_rate',
+        '-show_entries', 'stream=codec_type,codec_name,width,height,r_frame_rate',
         '-of', 'json',
         rtspOrHttpUrl,
       ],
       { timeout: 4500 }
     );
     const parsed = JSON.parse(stdout || '{}');
-    const streams: Array<{ codec_type?: string; width?: number; height?: number; r_frame_rate?: string }> =
+    const streams: Array<{ codec_type?: string; codec_name?: string; width?: number; height?: number; r_frame_rate?: string }> =
       parsed.streams || [];
     const video = streams.find((s) => s.codec_type === 'video');
     const audio = streams.find((s) => s.codec_type === 'audio');
@@ -481,6 +1004,7 @@ export async function probeMediaStream(
       resolution: video?.width && video?.height ? `${video.width}x${video.height}` : 'Auto',
       fps,
       hasAudio: Boolean(audio),
+      audioCodec: audio?.codec_name,
     };
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -545,7 +1069,206 @@ export function discoverSsdpDevices(timeoutMs = 1100): Promise<Array<{ ip: strin
           sock.setBroadcast(true);
           sock.send(ssdpMsg, 0, ssdpMsg.length, 1900, '239.255.255.250');
         } catch {
-          // Ignore send errors
+          // Ignore
+        }
+      });
+    }
+
+    setTimeout(() => {
+      for (const s of sockets) {
+        try {
+          s.close();
+        } catch {
+          // Ignore
+        }
+      }
+      resolve(found);
+    }, timeoutMs);
+  });
+}
+
+export async function discoverArpNeighbors(): Promise<Array<{ ip: string; mac?: string }>> {
+  const results: Array<{ ip: string; mac?: string }> = [];
+  const seen = new Set<string>();
+  const localIps = new Set(getAllLocalIPv4Addresses().map((i) => i.address));
+
+  const addIfValid = (ip: string, mac?: string) => {
+    if (!/^\d+\.\d+\.\d+\.\d+$/.test(ip)) return;
+    if (localIps.has(ip) || seen.has(ip)) return;
+    const octets = ip.split('.').map(Number);
+    if (octets[0] === 127 || octets[0] >= 224 || octets[3] === 0 || octets[3] === 255) return;
+    seen.add(ip);
+    results.push({ ip, mac });
+  };
+
+  try {
+    const { stdout } = await execFileAsync('ip', ['neigh', 'show'], { timeout: 1000 });
+    for (const line of stdout.split('\n')) {
+      if (line.includes('FAILED') || line.includes('INCOMPLETE')) continue;
+      const m = line.match(/^(\d+\.\d+\.\d+\.\d+)\s+dev\s+\S+(?:\s+lladdr\s+([0-9a-f:]+))?/i);
+      if (m) addIfValid(m[1], m[2]);
+    }
+  } catch {
+    // Fallback to /proc/net/arp
+  }
+
+  try {
+    const arpText = await fs.readFile('/proc/net/arp', 'utf8');
+    for (const line of arpText.split('\n').slice(1)) {
+      const cols = line.trim().split(/\s+/);
+      if (cols.length >= 4 && cols[2] !== '0x0' && cols[3] !== '00:00:00:00:00:00') {
+        addIfValid(cols[0], cols[3]);
+      }
+    }
+  } catch {
+    // Ignore on non-Linux
+  }
+
+  return results;
+}
+
+function encodeDnsName(name: string): Buffer {
+  const parts = name.split('.').filter(Boolean);
+  const chunks: Buffer[] = [];
+  for (const part of parts) {
+    const buf = Buffer.from(part, 'utf8');
+    chunks.push(Buffer.from([buf.length]), buf);
+  }
+  chunks.push(Buffer.from([0]));
+  return Buffer.concat(chunks);
+}
+
+function buildMdnsPtrQuery(service: string): Buffer {
+  const header = Buffer.from([
+    0x00, 0x00, // ID
+    0x00, 0x00, // Flags (standard query)
+    0x00, 0x01, // QDCOUNT = 1
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+  ]);
+  const qname = encodeDnsName(service);
+  const qtypeClass = Buffer.from([0x00, 0x0c, 0x00, 0x01]); // PTR, IN
+  return Buffer.concat([header, qname, qtypeClass]);
+}
+
+export function discoverMdnsCameras(timeoutMs = 1100): Promise<Array<{ ip: string; port: number; serviceName: string }>> {
+  return new Promise((resolve) => {
+    const found: Array<{ ip: string; port: number; serviceName: string }> = [];
+    const seen = new Set<string>();
+    const interfaces = getAllLocalIPv4Addresses();
+    const sockets: dgram.Socket[] = [];
+    const queries = [
+      buildMdnsPtrQuery('_rtsp._tcp.local'),
+      buildMdnsPtrQuery('_onvif._tcp.local'),
+      buildMdnsPtrQuery('_http._tcp.local'),
+    ];
+
+    const bindTargets = interfaces.length > 0 ? interfaces.map((i) => i.address) : [undefined];
+    for (const bindIp of bindTargets) {
+      const sock = dgram.createSocket('udp4');
+      sockets.push(sock);
+      sock.on('message', (msg, rinfo) => {
+        if (seen.has(rinfo.address)) return;
+        const ascii = msg.toString('latin1').replace(/[^\x20-\x7e]/g, ' ').toLowerCase();
+        const isCamLike =
+          ascii.includes('rtsp') ||
+          ascii.includes('onvif') ||
+          ascii.includes('cam') ||
+          ascii.includes('nvr') ||
+          ascii.includes('hikvision') ||
+          ascii.includes('dahua') ||
+          ascii.includes('axis') ||
+          ascii.includes('esp');
+        if (!isCamLike) return;
+        seen.add(rinfo.address);
+        const port = ascii.includes('rtsp') ? 554 : 80;
+        found.push({
+          ip: rinfo.address,
+          port,
+          serviceName: ascii.includes('rtsp') ? 'mDNS RTSP' : ascii.includes('onvif') ? 'mDNS ONVIF' : 'mDNS HTTP Cam',
+        });
+      });
+      sock.on('error', () => {});
+      sock.bind(0, bindIp, () => {
+        try {
+          sock.setBroadcast(true);
+          for (const q of queries) {
+            sock.send(q, 0, q.length, 5353, '224.0.0.251');
+          }
+        } catch {
+          // Ignore
+        }
+      });
+    }
+
+    setTimeout(() => {
+      for (const s of sockets) {
+        try {
+          s.close();
+        } catch {
+          // Ignore
+        }
+      }
+      resolve(found);
+    }, timeoutMs);
+  });
+}
+
+export function discoverVendorUdpCameras(timeoutMs = 1100): Promise<Array<{ ip: string; port: number; vendor: string; protocol: 'RTSP' | 'ONVIF' }>> {
+  return new Promise((resolve) => {
+    const found: Array<{ ip: string; port: number; vendor: string; protocol: 'RTSP' | 'ONVIF' }> = [];
+    const seen = new Set<string>();
+    const interfaces = getAllLocalIPv4Addresses();
+    const sockets: dgram.Socket[] = [];
+
+    // 1. XMeye / iCSee / Xiongmai NetIP UDP 34569 search packet (20-byte header)
+    const xmeyeProbe = Buffer.from([
+      0xff, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xfa, 0x05,
+      0x00, 0x00, 0x00, 0x00,
+    ]);
+    // 2. Dahua UDP 37810 discovery header
+    const dahuaProbe = Buffer.from('DHDiscover\x00\x00\x00\x00\x00\x00', 'latin1');
+    // 3. Hikvision SADP UDP 37020 inquiry XML
+    const hikProbe = Buffer.from(
+      `<?xml version="1.0" encoding="utf-8"?><Probe><Uuid>${crypto.randomUUID()}</Uuid><Types>inquiry</Types></Probe>`,
+      'utf8'
+    );
+
+    const bindTargets = interfaces.length > 0 ? interfaces : [{ address: '0.0.0.0', subnet: '255.255.255' }];
+    for (const iface of bindTargets) {
+      const sock = dgram.createSocket('udp4');
+      sockets.push(sock);
+      sock.on('message', (msg, rinfo) => {
+        if (seen.has(rinfo.address)) return;
+        seen.add(rinfo.address);
+        const txt = msg.toString('utf8');
+        let vendor = 'Cámara IP';
+        if (txt.includes('ProbeMatch') || txt.includes('DeviceType')) {
+          vendor = 'Hikvision SADP';
+        } else if (txt.includes('HostIP') || txt.includes('NetIP') || rinfo.port === 34569) {
+          vendor = 'XMeye / iCSee';
+        } else if (txt.includes('DH') || rinfo.port === 37810) {
+          vendor = 'Dahua / Amcrest';
+        }
+        found.push({
+          ip: rinfo.address,
+          port: 554,
+          vendor,
+          protocol: 'ONVIF',
+        });
+      });
+      sock.on('error', () => {});
+      sock.bind(0, iface.address === '0.0.0.0' ? undefined : iface.address, () => {
+        try {
+          sock.setBroadcast(true);
+          const bcast = iface.subnet === '255.255.255' ? '255.255.255.255' : `${iface.subnet}.255`;
+          sock.send(xmeyeProbe, 0, xmeyeProbe.length, 34569, bcast);
+          sock.send(xmeyeProbe, 0, xmeyeProbe.length, 34569, '255.255.255.255');
+          sock.send(dahuaProbe, 0, dahuaProbe.length, 37810, bcast);
+          sock.send(dahuaProbe, 0, dahuaProbe.length, 37810, '255.255.255.255');
+          sock.send(hikProbe, 0, hikProbe.length, 37020, '239.255.255.250');
+        } catch {
+          // Ignore broadcast socket errors
         }
       });
     }

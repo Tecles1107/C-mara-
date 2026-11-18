@@ -46,6 +46,7 @@ interface CameraSidebarProps {
     name: string;
     ip: string;
     port: number;
+    remoteHost?: string;
     streamPath: string;
     protocol: CameraProtocol;
     username?: string;
@@ -89,6 +90,7 @@ export const CameraSidebar: React.FC<CameraSidebarProps> = ({
   const [newName, setNewName] = useState('');
   const [newIp, setNewIp] = useState('192.168.1.');
   const [newPort, setNewPort] = useState('554');
+  const [newRemoteHost, setNewRemoteHost] = useState('');
   const [newPath, setNewPath] = useState('/live/ch00_0');
   const [newProtocol, setNewProtocol] = useState<CameraProtocol>('RTSP');
   const [newUsername, setNewUsername] = useState('');
@@ -101,6 +103,7 @@ export const CameraSidebar: React.FC<CameraSidebarProps> = ({
       name: newName.trim(),
       ip: newIp.trim(),
       port: Number(newPort) || 554,
+      remoteHost: newRemoteHost.trim() || undefined,
       streamPath: newPath.trim() || '/live/ch00_0',
       protocol: newProtocol,
       username: newUsername.trim() || undefined,
@@ -108,6 +111,7 @@ export const CameraSidebar: React.FC<CameraSidebarProps> = ({
     });
     setNewName('');
     setNewIp('192.168.1.');
+    setNewRemoteHost('');
     setNewUsername('');
     setNewPassword('');
   };
@@ -277,6 +281,13 @@ export const CameraSidebar: React.FC<CameraSidebarProps> = ({
               onChange={(e) => setNewPath(e.target.value)}
               className="w-full px-2.5 py-1.5 bg-slate-900 border border-slate-800 rounded text-xs font-mono text-slate-100 focus:outline-none focus:border-sky-500"
             />
+            <input
+              type="text"
+              placeholder="Host remoto / DDNS / VPN (opc.)"
+              value={newRemoteHost}
+              onChange={(e) => setNewRemoteHost(e.target.value)}
+              className="w-full px-2.5 py-1.5 bg-slate-900 border border-slate-800 rounded text-xs font-mono text-slate-100 placeholder:text-slate-500 focus:outline-none focus:border-sky-500"
+            />
             <div className="grid grid-cols-2 gap-2">
               <input
                 type="text"
@@ -422,10 +433,16 @@ export const CameraSidebar: React.FC<CameraSidebarProps> = ({
                         {cam.status === 'online' ? 'En línea' : 'Sin señal'}
                       </span>
                     </div>
-                    <div className="mt-1 flex items-center gap-1.5 text-xs text-slate-400 font-mono tabular-nums">
+                    <div className="mt-1 flex items-center gap-1.5 text-xs text-slate-400 font-mono tabular-nums truncate">
                       <span>{cam.ip}:{cam.port}</span>
                       <span aria-hidden="true">·</span>
                       <span>{cam.protocol}</span>
+                      {cam.activeEndpoint === 'remote' && (
+                        <>
+                          <span aria-hidden="true">·</span>
+                          <span className="text-sky-400">Remoto</span>
+                        </>
+                      )}
                       {cam.latencyMs !== undefined && (
                         <>
                           <span aria-hidden="true">·</span>

@@ -11,7 +11,7 @@ export type ProcessStatus = 'running' | 'completed' | 'cancelled' | 'timeout' | 
 
 export interface ProcessOperationRecord {
   id: string;
-  kind: 'scan' | 'nmap' | 'onvif' | 'ssdp' | 'stream' | 'audio' | 'talk' | 'verify';
+  kind: 'scan' | 'nmap' | 'onvif' | 'ssdp' | 'mdns' | 'arp' | 'vendor-udp' | 'stream' | 'audio' | 'talk' | 'verify';
   target: string;
   pid?: number;
   status: ProcessStatus;
@@ -20,6 +20,32 @@ export interface ProcessOperationRecord {
   durationMs?: number;
   exitCode?: number | null;
   detail?: string;
+}
+
+export type DiagnosticFeature = 'video' | 'audio' | 'talk' | 'ptz' | 'light' | 'ir' | 'verify' | 'scan';
+
+export interface DiagnosticSample {
+  id: string;
+  timestamp: number;
+  ip: string;
+  feature: DiagnosticFeature;
+  status: 'ok' | 'warn' | 'error';
+  method?: string;
+  code?: string | number;
+  latencyMs?: number;
+  reason: string;
+  suggestion?: string;
+}
+
+export interface CapabilityCheckItem {
+  feature: DiagnosticFeature;
+  label: string;
+  supported: boolean;
+  status: 'ok' | 'warn' | 'error';
+  method?: string;
+  latencyMs?: number;
+  reason: string;
+  suggestion?: string;
 }
 
 export function getScanConfigForProfile(

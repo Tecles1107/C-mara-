@@ -1,17 +1,21 @@
 import React, { useEffect, useState } from 'react';
-import { KeyRound, RefreshCw, ShieldCheck, X } from 'lucide-react';
-import { CameraChannel, CameraProtocol } from '../utils/cameraLogic';
+import { Globe, KeyRound, RefreshCw, Save, ShieldCheck, Trash2, X } from 'lucide-react';
+import { CameraChannel, CameraProtocol, ConnectionMode } from '../utils/cameraLogic';
 
 interface CameraCredentialsModalProps {
   camera: CameraChannel | null;
   onClose: () => void;
+  onSaveOnly?: (updated: CameraChannel) => Promise<void>;
   onSaveAndVerify: (updated: CameraChannel) => Promise<void>;
+  onDelete?: (id: string) => Promise<void>;
 }
 
 export const CameraCredentialsModal: React.FC<CameraCredentialsModalProps> = ({
   camera,
   onClose,
+  onSaveOnly,
   onSaveAndVerify,
+  onDelete,
 }) => {
   const [name, setName] = useState('');
   const [ip, setIp] = useState('');
@@ -21,7 +25,13 @@ export const CameraCredentialsModal: React.FC<CameraCredentialsModalProps> = ({
   const [streamPath, setStreamPath] = useState('/live/ch00_0');
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
+  const [remoteHost, setRemoteHost] = useState('');
+  const [remotePort, setRemotePort] = useState('');
+  const [remoteOnvifPort, setRemoteOnvifPort] = useState('');
+  const [connectionMode, setConnectionMode] = useState<ConnectionMode>('auto');
+  const [notes, setNotes] = useState('');
   const [verifying, setVerifying] = useState(false);
+  const [confirmDelete, setConfirmDelete] = useState(false);
 
   useEffect(() => {
     if (!camera) return;
@@ -33,60 +43,92 @@ export const CameraCredentialsModal: React.FC<CameraCredentialsModalProps> = ({
     setStreamPath(camera.streamPath);
     setUsername(camera.username || '');
     setPassword(camera.password || '');
+    setRemoteHost(camera.remoteHost || '');
+    setRemotePort(camera.remotePort ? String(camera.remotePort) : '');
+    setRemoteOnvifPort(camera.remoteOnvifPort ? String(camera.remoteOnvifPort) : '');
+    setConnectionMode(camera.connectionMode || 'auto');
+    setNotes(camera.notes || '');
+    setConfirmDelete(false);
   }, [camera]);
 
   if (!camera) return null;
 
-  const handleSubmit = async (e: React.FormEvent) => {
+  const buildUpdatedCamera = (): CameraChannel => ({
+    ...camera,
+    name: name.trim() || camera.name,
+    ip: ip.trim() || camera.ip,
+    port: Number(port) || camera.port,
+    onvifPort: onvifPort.trim() ? Number(onvifPort.trim()) : undefined,
+    protocol,
+    streamPath: streamPath.trim() || '/live/ch00_0',
+    username: username.trim() || undefined,
+    password: password || undefined,
+    remoteHost: remoteHost.trim() || undefined,
+    remotePort: remotePort.trim() ? Number(remotePort.trim()) : undefined,
+    remoteOnvifPort: remoteOnvifPort.trim() ? Number(remoteOnvifPort.trim()) : undefined,
+    connectionMode,
+    notes: notes.trim() || undefined,
+    isSaved: true,
+    lastSeenAt: camera.lastSeenAt || Date.now(),
+  });
+
+  const handleSubmitVerify = async (e: React.FormEvent) => {
     e.preventDefault();
     setVerifying(true);
     try {
-      await onSaveAndVerify({
-        ...camera,
-        name: name.trim() || camera.name,
-        ip: ip.trim() || camera.ip,
-        port: Number(port) || camera.port,
-        onvifPort: onvifPort.trim() ? Number(onvifPort.trim()) : undefined,
-        protocol,
-        streamPath: streamPath.trim() || '/live/ch00_0',
-        username: username.trim() || undefined,
-        password: password || undefined,
-      });
+      await onSaveAndVerify(buildUpdatedCamera());
       onClose();
     } finally {
       setVerifying(false);
     }
   };
 
+  const handleSaveOnly = async () => {
+    if (!onSaveOnly) return;
+    setVerifying(true);
+    try {
+      await onSaveOnly(buildUpdatedCamera());
+      onClose();
+    } finally {
+      setVerifying(false);
+    }
+  };
+
+  const handleDelete = async () => {
+    if (!onDelete) return;
+    await onDelete(camera.id);
+    onClose();
+  };
+
   return (
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4"
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 p-4 overflow-y-auto"
       role="dialog"
       aria-modal="true"
       aria-labelledby="creds-modal-title"
     >
-      <div className="w-full max-w-md bg-slate-900 border border-slate-800 rounded-xl shadow-2xl overflow-hidden">
+      <div className="w-full max-w-lg bg-slate-900 border border-slate-800 rounded-xl shadow-2xl overflow-hidden my-auto">
         <div className="flex items-center justify-between px-5 py-4 border-b border-slate-800">
           <div className="flex items-center gap-2">
             <KeyRound className="w-4 h-4 text-sky-400" />
             <h3 id="creds-modal-title" className="text-base font-semibold text-slate-100">
-              Conexión y Credenciales
+              Editar Cámara, Red Remota y Credenciales
             </h3>
           </div>
           <button
             type="button"
             onClick={onClose}
-            aria-label="Cerrar conexión y credenciales"
+            aria-label="Cerrar edición de cámara"
             className="p-1.5 text-slate-400 hover:text-slate-100 rounded-md hover:bg-slate-800 transition-colors cursor-pointer"
           >
             <X className="w-4 h-4" />
           </button>
         </div>
 
-        <form onSubmit={handleSubmit} className="p-5 space-y-4">
-          <div className="grid grid-cols-2 gap-3">
+        <form onSubmit={handleSubmitVerify} className="p-5 space-y-4 max-h-[82vh] overflow-y-auto">
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
             <label className="block space-y-1">
-              <span className="text-xs text-slate-400">Nombre</span>
+              <span className="text-xs text-slate-400">Nombre de cámara</span>
               <input
                 type="text"
                 value={name}
@@ -111,8 +153,8 @@ export const CameraCredentialsModal: React.FC<CameraCredentialsModalProps> = ({
           </div>
 
           <div className="grid grid-cols-3 gap-3">
-            <label className="block space-y-1 col-span-1">
-              <span className="text-xs text-slate-400">IP</span>
+            <label className="block space-y-1">
+              <span className="text-xs text-slate-400">IP Local</span>
               <input
                 type="text"
                 value={ip}
@@ -131,7 +173,7 @@ export const CameraCredentialsModal: React.FC<CameraCredentialsModalProps> = ({
               />
             </label>
             <label className="block space-y-1">
-              <span className="text-xs text-slate-400">Puerto ONVIF/HTTP</span>
+              <span className="text-xs text-slate-400">Puerto ONVIF</span>
               <input
                 type="number"
                 placeholder="80 / 8899"
@@ -143,7 +185,7 @@ export const CameraCredentialsModal: React.FC<CameraCredentialsModalProps> = ({
           </div>
 
           <label className="block space-y-1">
-            <span className="text-xs text-slate-400">Ruta del stream (se autodetecta al verificar)</span>
+            <span className="text-xs text-slate-400">Ruta del stream</span>
             <input
               type="text"
               value={streamPath}
@@ -152,9 +194,62 @@ export const CameraCredentialsModal: React.FC<CameraCredentialsModalProps> = ({
             />
           </label>
 
-          <div className="pt-2 border-t border-slate-800 grid grid-cols-2 gap-3">
+          {/* Remote Access Section */}
+          <div className="p-3 bg-slate-950/80 border border-slate-800 rounded-lg space-y-3">
+            <div className="flex items-center justify-between gap-2">
+              <div className="flex items-center gap-1.5 text-xs font-medium text-sky-300">
+                <Globe className="w-3.5 h-3.5" />
+                <span>Conexión Remota (Datos Móviles / Otro Wi-Fi)</span>
+              </div>
+              <select
+                aria-label="Modo de conexión"
+                value={connectionMode}
+                onChange={(e) => setConnectionMode(e.target.value as ConnectionMode)}
+                className="px-2 py-1 bg-slate-900 border border-slate-800 rounded text-[11px] text-slate-200 cursor-pointer"
+              >
+                <option value="auto">Automático (Local → Remoto)</option>
+                <option value="local">Solo Local (LAN)</option>
+                <option value="remote">Solo Remoto</option>
+              </select>
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
+              <label className="block space-y-1 sm:col-span-1">
+                <span className="text-[11px] text-slate-400">Host Remoto / DDNS / VPN</span>
+                <input
+                  type="text"
+                  placeholder="casa.duckdns.org"
+                  value={remoteHost}
+                  onChange={(e) => setRemoteHost(e.target.value)}
+                  className="w-full px-2.5 py-1.5 bg-slate-900 border border-slate-800 rounded text-xs font-mono text-slate-100 placeholder:text-slate-600 focus:outline-none focus:border-sky-500"
+                />
+              </label>
+              <label className="block space-y-1">
+                <span className="text-[11px] text-slate-400">Puerto Video Remoto</span>
+                <input
+                  type="number"
+                  placeholder={port || '554'}
+                  value={remotePort}
+                  onChange={(e) => setRemotePort(e.target.value)}
+                  className="w-full px-2.5 py-1.5 bg-slate-900 border border-slate-800 rounded text-xs font-mono text-slate-100 placeholder:text-slate-600 focus:outline-none focus:border-sky-500"
+                />
+              </label>
+              <label className="block space-y-1">
+                <span className="text-[11px] text-slate-400">Puerto ONVIF Remoto</span>
+                <input
+                  type="number"
+                  placeholder={onvifPort || '80'}
+                  value={remoteOnvifPort}
+                  onChange={(e) => setRemoteOnvifPort(e.target.value)}
+                  className="w-full px-2.5 py-1.5 bg-slate-900 border border-slate-800 rounded text-xs font-mono text-slate-100 placeholder:text-slate-600 focus:outline-none focus:border-sky-500"
+                />
+              </label>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-2 gap-3">
             <label className="block space-y-1">
-              <span className="text-xs text-slate-400">Usuario (opcional)</span>
+              <span className="text-xs text-slate-400">Usuario</span>
               <input
                 type="text"
                 placeholder="admin"
@@ -164,7 +259,7 @@ export const CameraCredentialsModal: React.FC<CameraCredentialsModalProps> = ({
               />
             </label>
             <label className="block space-y-1">
-              <span className="text-xs text-slate-400">Contraseña (opcional)</span>
+              <span className="text-xs text-slate-400">Contraseña</span>
               <input
                 type="password"
                 placeholder="••••••••"
@@ -175,26 +270,75 @@ export const CameraCredentialsModal: React.FC<CameraCredentialsModalProps> = ({
             </label>
           </div>
 
-          <div className="pt-3 flex items-center justify-end gap-2">
-            <button
-              type="button"
-              onClick={onClose}
-              className="px-3.5 py-2 text-xs font-medium text-slate-300 bg-slate-800 hover:bg-slate-700 rounded-lg transition-colors cursor-pointer"
-            >
-              Cancelar
-            </button>
-            <button
-              type="submit"
-              disabled={verifying}
-              className="flex items-center gap-1.5 px-4 py-2 text-xs font-medium text-white bg-sky-600 hover:bg-sky-500 disabled:opacity-60 rounded-lg transition-colors cursor-pointer"
-            >
-              {verifying ? (
-                <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+          <label className="block space-y-1">
+            <span className="text-xs text-slate-400">Notas / Ubicación (opcional)</span>
+            <input
+              type="text"
+              placeholder="Ej. Portón exterior · Router principal"
+              value={notes}
+              onChange={(e) => setNotes(e.target.value)}
+              className="w-full px-3 py-1.5 bg-slate-950 border border-slate-800 rounded text-xs text-slate-100 focus:outline-none focus:border-sky-500"
+            />
+          </label>
+
+          <div className="pt-3 border-t border-slate-800 flex flex-wrap items-center justify-between gap-2">
+            {onDelete ? (
+              confirmDelete ? (
+                <div className="flex items-center gap-1.5">
+                  <button
+                    type="button"
+                    onClick={handleDelete}
+                    className="px-2.5 py-1.5 text-xs font-medium text-white bg-red-600 hover:bg-red-500 rounded-md transition-colors cursor-pointer"
+                  >
+                    Confirmar eliminar
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setConfirmDelete(false)}
+                    className="px-2 py-1.5 text-xs text-slate-400 hover:text-slate-200 cursor-pointer"
+                  >
+                    No
+                  </button>
+                </div>
               ) : (
-                <ShieldCheck className="w-3.5 h-3.5" />
+                <button
+                  type="button"
+                  onClick={() => setConfirmDelete(true)}
+                  className="flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium text-red-400 hover:text-red-300 hover:bg-red-950/50 rounded-md transition-colors cursor-pointer"
+                >
+                  <Trash2 className="w-3.5 h-3.5" />
+                  <span>Eliminar</span>
+                </button>
+              )
+            ) : (
+              <span />
+            )}
+
+            <div className="flex flex-wrap items-center gap-2">
+              {onSaveOnly && (
+                <button
+                  type="button"
+                  onClick={handleSaveOnly}
+                  disabled={verifying}
+                  className="flex items-center gap-1.5 px-3 py-2 text-xs font-medium text-slate-200 bg-slate-800 hover:bg-slate-700 rounded-lg transition-colors cursor-pointer"
+                >
+                  <Save className="w-3.5 h-3.5" />
+                  <span>Guardar</span>
+                </button>
               )}
-              <span>{verifying ? 'Verificando...' : 'Verificar y Guardar'}</span>
-            </button>
+              <button
+                type="submit"
+                disabled={verifying}
+                className="flex items-center gap-1.5 px-3.5 py-2 text-xs font-medium text-white bg-sky-600 hover:bg-sky-500 disabled:opacity-60 rounded-lg transition-colors cursor-pointer"
+              >
+                {verifying ? (
+                  <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                ) : (
+                  <ShieldCheck className="w-3.5 h-3.5" />
+                )}
+                <span>{verifying ? 'Verificando...' : 'Verificar y Guardar'}</span>
+              </button>
+            </div>
           </div>
         </form>
       </div>
