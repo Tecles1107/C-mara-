@@ -2,23 +2,21 @@
 set -e
 
 echo "=== Instalador de VigíaLAN para Termux ==="
-echo "[1/5] Actualizando repositorios y paquetes base de Termux..."
-pkg update -y && pkg upgrade -y
-
-echo "[2/5] Instalando las versiones más recientes de Node.js, FFmpeg, Nmap y Termux-API..."
+echo "[1/4] Actualizando repositorios e instalando paquetes..."
+export DEBIAN_FRONTEND=noninteractive
+pkg update -y
 pkg install -y nodejs ffmpeg nmap termux-api git
 
-echo "[3/5] Configurando acceso al almacenamiento interno..."
+echo "[2/4] Configurando almacenamiento interno..."
 termux-setup-storage || true
 mkdir -p /sdcard/DCIM/VigiaLAN_Clips
 
-echo "[4/5] Instalando y actualizando dependencias de Node.js..."
-npm install --no-audit --no-fund
-npm update
+echo "[3/4] Instalando dependencias de Node.js..."
+npm install --legacy-peer-deps --no-audit --no-fund
 
-echo "[5/5] Instalación completada."
+echo "[4/4] Instalación completada."
 echo ""
-echo "Para iniciar VigíaLAN en tu red local, ejecuta:"
+echo "Para iniciar VigíaLAN, ejecuta:"
 echo "  npm run dev"
 echo ""
 echo "Luego abre en tu navegador:"

@@ -1,11 +1,20 @@
 export type CameraProtocol = 'RTSP' | 'ONVIF' | 'MJPEG' | 'HTTP-FLV';
 export type ViewMode = 'single' | 'mosaic' | 'termux';
+export type AuthStatus = 'open' | 'verified' | 'required' | 'failed' | 'unknown';
+
+export interface CameraCapabilities {
+  ptz: boolean;
+  audio: boolean;
+  light: boolean;
+  twoWayAudio: boolean;
+}
 
 export interface CameraChannel {
   id: string;
   name: string;
   ip: string;
   port: number;
+  onvifPort?: number;
   protocol: CameraProtocol;
   streamPath: string;
   status: 'online' | 'offline';
@@ -14,6 +23,21 @@ export interface CameraChannel {
   hasAudio: boolean;
   location: string;
   nightVision: boolean;
+  username?: string;
+  password?: string;
+  profileToken?: string;
+  manufacturer?: string;
+  model?: string;
+  authStatus?: AuthStatus;
+  latencyMs?: number;
+  capabilities?: CameraCapabilities;
+}
+
+export interface CameraFilterOptions {
+  onlyOnline: boolean;
+  protocol?: CameraProtocol | 'ALL';
+  onlyAudio?: boolean;
+  onlyPtz?: boolean;
 }
 
 export interface MotionAlertConfig {
@@ -47,7 +71,37 @@ export interface RecordedClip {
 export function buildStreamUrl(camera: CameraChannel): string {
   const scheme = camera.protocol === 'RTSP' || camera.protocol === 'ONVIF' ? 'rtsp' : 'http';
   const cleanPath = camera.streamPath.startsWith('/') ? camera.streamPath : `/${camera.streamPath}`;
-  return `${scheme}://${camera.ip}:${camera.port}${cleanPath}`;
+  let authPrefix = '';
+  if (camera.username && camera.username.trim()) {
+    const user = encodeURIComponent(camera.username.trim());
+    const pass = encodeURIComponent(camera.password || '');
+    authPrefix = `${user}:${pass}@`;
+  }
+  return `${scheme}://${authPrefix}${camera.ip}:${camera.port}${cleanPath}`;
+}
+
+export function parseSubnetInputs(rawInput: string, fallbackSubnets: string[]): string[] {
+  const trimmed = rawInput.trim();
+  if (!trimmed) return fallbackSubnets;
+
+  const parts = trimmed
+    .split(/[,\s;]+/)
+    .map((p) => p.trim())
+    .filter(Boolean);
+
+  const normalized = new Set<string>();
+  for (const part of parts) {
+    // Strip CIDR suffix like /24 or trailing dot
+    const clean = part.replace(/\/\d+$/, '').replace(/\.$/, '');
+    const octets = clean.split('.');
+    if (octets.length === 3 && octets.every((o) => /^\d+$/.test(o) && Number(o) <= 255)) {
+      normalized.add(clean);
+    } else if (octets.length === 4 && octets.every((o) => /^\d+$/.test(o) && Number(o) <= 255)) {
+      normalized.add(`${octets[0]}.${octets[1]}.${octets[2]}`);
+    }
+  }
+
+  return normalized.size > 0 ? Array.from(normalized) : fallbackSubnets;
 }
 
 export const INITIAL_CAMERAS: CameraChannel[] = [];
@@ -64,17 +118,28 @@ export const DEFAULT_MOTION_CONFIG: MotionAlertConfig = {
 export function filterCameras(
   cameras: CameraChannel[],
   query: string,
-  onlyOnline: boolean
+  onlyOnlineOrOpts: boolean | CameraFilterOptions
 ): CameraChannel[] {
+  const opts: CameraFilterOptions =
+    typeof onlyOnlineOrOpts === 'boolean'
+      ? { onlyOnline: onlyOnlineOrOpts, protocol: 'ALL' }
+      : onlyOnlineOrOpts;
+
   const q = query.trim().toLowerCase();
   return cameras.filter((cam) => {
-    if (onlyOnline && cam.status !== 'online') return false;
+    if (opts.onlyOnline && cam.status !== 'online') return false;
+    if (opts.protocol && opts.protocol !== 'ALL' && cam.protocol !== opts.protocol) return false;
+    if (opts.onlyAudio && !cam.hasAudio && !cam.capabilities?.audio) return false;
+    if (opts.onlyPtz && !cam.capabilities?.ptz && cam.protocol !== 'ONVIF') return false;
     if (!q) return true;
     return (
       cam.name.toLowerCase().includes(q) ||
       cam.ip.toLowerCase().includes(q) ||
+      String(cam.port).includes(q) ||
       cam.protocol.toLowerCase().includes(q) ||
-      cam.location.toLowerCase().includes(q)
+      cam.location.toLowerCase().includes(q) ||
+      (cam.manufacturer || '').toLowerCase().includes(q) ||
+      (cam.model || '').toLowerCase().includes(q)
     );
   });
 }
@@ -152,9 +217,9 @@ export function buildTermuxScript(subnet = '192.168.1.0/24', port = 3000): strin
 pkg update -y && pkg install -y nodejs ffmpeg nmap termux-api
 termux-setup-storage
 
-# 1. Escanear cámaras sin autenticación en la red local (${subnet})
-echo "Escaneando puertos RTSP (554) y HTTP/MJPEG (80, 81, 8080)..."
-nmap -p 554,80,81,8080 --open ${subnet} -oG - | grep "/open/"
+# 1. Escanear cámaras en la red local (${subnet})
+echo "Escaneando puertos RTSP (554, 8554) y HTTP/ONVIF (80, 81, 8000, 8080, 8899)..."
+nmap -p 554,8554,80,81,8000,8080,8899 --open ${subnet} -oG - | grep "/open/"
 
 # 2. Guardar clips directamente en almacenamiento interno
 mkdir -p /sdcard/DCIM/VigiaLAN_Clips

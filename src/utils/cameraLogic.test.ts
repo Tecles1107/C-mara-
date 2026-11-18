@@ -1,8 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  INITIAL_CAMERAS,
   DEFAULT_MOTION_CONFIG,
+  buildStreamUrl,
+  parseSubnetInputs,
   filterCameras,
   clampZoomPan,
   calculateMotionScore,
@@ -12,18 +13,87 @@ import {
   buildTermuxScript,
 } from './cameraLogic';
 
-test('filterCameras filters by query and online status', () => {
-  const onlineOnly = filterCameras(INITIAL_CAMERAS, '', true);
+const TEST_CAMERAS = [
+  {
+    id: 'cam-01',
+    name: 'Acceso',
+    ip: '192.168.1.104',
+    port: 554,
+    protocol: 'RTSP' as const,
+    streamPath: '/live',
+    status: 'online' as const,
+    resolution: '1080p',
+    fps: 30,
+    hasAudio: true,
+    location: 'Norte',
+    nightVision: false,
+    manufacturer: 'Hikvision',
+    capabilities: { ptz: true, audio: true, light: false, twoWayAudio: false },
+  },
+  {
+    id: 'cam-02',
+    name: 'Jardín',
+    ip: '192.168.1.115',
+    port: 8080,
+    protocol: 'MJPEG' as const,
+    streamPath: '/video',
+    status: 'online' as const,
+    resolution: '720p',
+    fps: 20,
+    hasAudio: false,
+    location: 'Patio',
+    nightVision: true,
+    manufacturer: 'ESP32',
+    capabilities: { ptz: false, audio: false, light: true, twoWayAudio: false },
+  },
+  {
+    id: 'cam-03',
+    name: 'Taller',
+    ip: '192.168.1.140',
+    port: 81,
+    protocol: 'MJPEG' as const,
+    streamPath: '/stream',
+    status: 'offline' as const,
+    resolution: '600p',
+    fps: 15,
+    hasAudio: false,
+    location: 'Taller',
+    nightVision: false,
+  },
+];
+
+test('buildStreamUrl embeds credentials when provided', () => {
+  assert.equal(buildStreamUrl(TEST_CAMERAS[0]), 'rtsp://192.168.1.104:554/live');
+  assert.equal(
+    buildStreamUrl({ ...TEST_CAMERAS[0], username: 'admin', password: 'p@ss' }),
+    'rtsp://admin:p%40ss@192.168.1.104:554/live'
+  );
+});
+
+test('parseSubnetInputs normalizes multi-subnet and CIDR strings', () => {
+  assert.deepEqual(parseSubnetInputs('', ['192.168.1']), ['192.168.1']);
+  assert.deepEqual(
+    parseSubnetInputs('192.168.1.0/24, 10.0.0.55', ['192.168.1']),
+    ['192.168.1', '10.0.0']
+  );
+});
+
+test('filterCameras filters by query, protocol, and capabilities', () => {
+  const onlineOnly = filterCameras(TEST_CAMERAS, '', true);
   assert.equal(onlineOnly.every((c) => c.status === 'online'), true);
-  assert.equal(onlineOnly.length, 4);
+  assert.equal(onlineOnly.length, 2);
 
-  const byIp = filterCameras(INITIAL_CAMERAS, '192.168.1.104', false);
-  assert.equal(byIp.length, 1);
-  assert.equal(byIp[0].id, 'cam-01');
+  const byBrand = filterCameras(TEST_CAMERAS, 'hikvision', false);
+  assert.equal(byBrand.length, 1);
+  assert.equal(byBrand[0].id, 'cam-01');
 
-  const byProtocol = filterCameras(INITIAL_CAMERAS, 'mjpeg', true);
-  assert.equal(byProtocol.length, 1);
-  assert.equal(byProtocol[0].id, 'cam-03');
+  const byProtoAndAudio = filterCameras(TEST_CAMERAS, '', {
+    onlyOnline: true,
+    protocol: 'RTSP',
+    onlyAudio: true,
+  });
+  assert.equal(byProtoAndAudio.length, 1);
+  assert.equal(byProtoAndAudio[0].id, 'cam-01');
 });
 
 test('clampZoomPan resets pan at 1x and clamps at higher zoom', () => {
@@ -49,10 +119,8 @@ test('calculateMotionScore detects frame differences', () => {
 
 test('shouldTriggerMotionAlert respects threshold and cooldown', () => {
   const cfg = { ...DEFAULT_MOTION_CONFIG, sensitivity: 70, cooldownSeconds: 10 };
-  // threshold = 30
   assert.equal(shouldTriggerMotionAlert(25, cfg, 0, 20000), false);
   assert.equal(shouldTriggerMotionAlert(45, cfg, 0, 20000), true);
-  // within cooldown
   assert.equal(shouldTriggerMotionAlert(45, cfg, 15000, 20000), false);
 });
 
